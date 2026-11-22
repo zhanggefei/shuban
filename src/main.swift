@@ -250,8 +250,6 @@ final class Store: ObservableObject {
     @Published var monthAnchor: Date = cal.startOfDay(for: Date())
     @Published var selectedDay: Date = cal.startOfDay(for: Date())
     @Published var tab: Int = 1          // 0=日程 1=待办（默认落在待办：需求要求待办优先）
-    /// 面板态：0 = 日历/待办，1 = 录屏。录屏不是一个额外窗口，就是同一块面板的另一个态。
-    @Published var mode: Int = 0
     @Published var scope: Int = 0        // 0=只看我的日历 1=含团队共享日历
     /// 「待办」页内的二级筛选：0=进行中 1=已完成
     @Published var todoFilter: Int = 0
@@ -282,6 +280,8 @@ final class Store: ObservableObject {
     }
     /// 由 AppDelegate 注入：最小化窗口
     var onHide: (() -> Void)?
+    /// 由 AppDelegate 注入：打开某个子功能的独立窗口
+    var onOpenFeature: ((FeaturePane) -> Void)?
     @Published var dataURL: URL?
     @Published var refreshScript: URL?
     var projectDir: URL?
@@ -333,13 +333,15 @@ final class Store: ObservableObject {
 
     /// 这次启动是「重启书办」拉起来的
     private(set) var justRelaunched = false
+    /// 重启前开着的子功能窗口，回来要照原样再开一次（nil = 只开日历）
+    private(set) var reopenPane: FeaturePane?
 
-    /// 点「重启书办」时记下当前页面。重启是新进程，内存里什么都不剩，
-    /// 不落一个一次性键，回来就只剩日历页，用户会以为「没重启」。
-    func markRelaunch() {
+    /// 点「重启书办」时记下自己是从哪个窗口点的。重启是新进程，内存里什么都不剩，
+    /// 不落一个一次性键，回来就只剩日历窗，用户会以为「没重启」。
+    func markRelaunch(from pane: FeaturePane?) {
         let d = UserDefaults.standard
-        d.set(mode, forKey: "shuban.reopenMode")
-        d.set(Date().timeIntervalSince1970, forKey: "shuban.reopenModeAt")
+        d.set(pane?.rawValue ?? 0, forKey: "shuban.reopenPane")
+        d.set(Date().timeIntervalSince1970, forKey: "shuban.reopenPaneAt")
     }
 
     init() {
@@ -350,22 +352,24 @@ final class Store: ObservableObject {
         if let sc = ProcessInfo.processInfo.environment["WECAL_SCOPE"], let v = Int(sc) {
             scope = v
         }
-        // 点「重启书办」前记下的页面：一次性键，读完就删，正常退出不会把页面钉死在录屏上。
+        // 点「重启书办」前记下的窗口：一次性键，读完就删，正常退出不会把窗口钉死在录屏上。
         // 只认 90 秒内的记录 —— 万一那次重启没拉起来（键留了下来），
-        // 几天后正常启动就会莫名其妙落到录屏页，用户只会觉得「怎么老自己切过去」。
+        // 几天后正常启动就会莫名其妙弹出录屏窗，用户只会觉得「怎么老自己蹦出来」。
         let ud = UserDefaults.standard
-        if let m = ud.object(forKey: "shuban.reopenMode") as? Int {
-            let at = ud.double(forKey: "shuban.reopenModeAt")
+        if let m = ud.object(forKey: "shuban.reopenPane") as? Int {
+            let at = ud.double(forKey: "shuban.reopenPaneAt")
             let fresh = at > 0 && Date().timeIntervalSince1970 - at < 90
             if fresh {
-                mode = m
+                reopenPane = FeaturePane(rawValue: m)
                 justRelaunched = true
             }
-            ud.removeObject(forKey: "shuban.reopenMode")
-            ud.removeObject(forKey: "shuban.reopenModeAt")
+            ud.removeObject(forKey: "shuban.reopenPane")
+            ud.removeObject(forKey: "shuban.reopenPaneAt")
         }
-        // 验收钩子：WECAL_MODE=1 直接打开录屏面板（离屏拍图用，正常启动不设）
-        if let m = ProcessInfo.processInfo.environment["WECAL_MODE"], let v = Int(m) { mode = v }
+        // 验收钩子：WECAL_MODE=1/2 启动即打开对应子功能窗口（离屏拍图用，正常启动不设）
+        if let m = ProcessInfo.processInfo.environment["WECAL_MODE"], let v = Int(m) {
+            reopenPane = FeaturePane(rawValue: v)
+        }
         if let ds = ProcessInfo.processInfo.environment["WECAL_DAY"], let dt = Fmt.day.date(from: ds) {
             let day = cal.startOfDay(for: dt)
             selectedDay = day
@@ -1138,15 +1142,6 @@ enum Fnt {
 @inline(__always)
 func S(_ v: CGFloat) -> CGFloat { v * Fnt.scale }
 
-/// 页面名。日志和界面提示都走这一个映射，免得加了第三页之后某处还写着「日历 / 录屏」二元判断
-func modeName(_ m: Int) -> String {
-    switch m {
-    case 1: return "录屏"
-    case 2: return "笔记"
-    default: return "日历"
-    }
-}
-
 // MARK: - 主视图
 
 struct ContentView: View {
@@ -1182,15 +1177,7 @@ struct ContentView: View {
     }
 
     var body: some View {
-        Group {
-            if store.mode == 1 {
-                RecordPanel()
-            } else if store.mode == 2 {
-                NotePanel()
-            } else {
-                mainStack
-            }
-        }
+        mainStack
         // 对齐到顶部：万一内容仍然超出（极端比例），宁可裁底部也不要切掉表头
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(
@@ -1210,10 +1197,6 @@ struct ContentView: View {
         )
         // 回车兜底：输入法组字/未组字两种情况都由 AppDelegate 的按键监视器发信号
         .onChange(of: store.composerSubmitTick) { _ in submitTodo() }
-        // 页面切换留痕：只在「界面自己跳过去」时才需要追因，没有日志就只能靠猜
-        .onChange(of: store.mode) { m in
-            store.logUI("页面 → \(modeName(m))")
-        }
         .onAppear(perform: openPanelForTest)
         .alert("删除这条待办？", isPresented: Binding(
             get: { pendingDelete != nil },
@@ -1238,24 +1221,22 @@ struct ContentView: View {
             HStack(alignment: .center, spacing: S(9)) {
                 sealBadge
                 VStack(alignment: .leading, spacing: 1) {
-                    HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        Text(monthTitle).font(Fnt.s(21, .heavy, .rounded))
-                            .foregroundColor(Theme.sched)
-                        Text(yearTitle)
-                            .font(Fnt.s(9.5, .semibold, .rounded))
-                            .foregroundColor(Theme.goldDeep)
-                            .padding(.horizontal, S(4))
-                            .padding(.vertical, S(1))
-                            .background(Capsule().fill(Theme.todo.opacity(0.18)))
+                    Button(action: backToToday) {
+                        HStack(alignment: .firstTextBaseline, spacing: 4) {
+                            Text(monthTitle).font(Fnt.s(21, .heavy, .rounded))
+                                .foregroundColor(Theme.sched)
+                            Text(yearTitle)
+                                .font(Fnt.s(9.5, .semibold, .rounded))
+                                .foregroundColor(Theme.goldDeep)
+                                .padding(.horizontal, S(4))
+                                .padding(.vertical, S(1))
+                                .background(Capsule().fill(Theme.todo.opacity(0.18)))
+                        }
+                        .contentShape(Rectangle())
                     }
-                    HStack(spacing: 3) {
-                        Image(systemName: "calendar.badge.clock")
-                            .font(Fnt.s(8.5, .semibold))
-                            .foregroundColor(Theme.sched.opacity(0.75))
-                        Text(daySubtitle).font(Fnt.s(10))
-                            .foregroundColor(Theme.inkSoft)
-                            .lineLimit(1)
-                    }
+                    .buttonStyle(.plain)
+                    .help("回到今天")
+                    subtitleRow
                 }
                 Spacer(minLength: 0)
                 HStack(spacing: 3) {
@@ -1267,7 +1248,7 @@ struct ContentView: View {
                     .rotationEffect(.degrees(store.refreshing ? 360 : 0))
                     .animation(store.refreshing ? .linear(duration: 1).repeatForever(autoreverses: false) : .default,
                                value: store.refreshing)
-                    moreMenu
+                    featureMenu
                     iconButton("minus") { store.onHide?() }.help("最小化到程序坞")
                 }
             }
@@ -1275,6 +1256,87 @@ struct ContentView: View {
             .padding(.top, S(8))
             .padding(.bottom, S(7))
         }
+    }
+
+    /// 标题下那行小字。录制中整行换成「计时 + 停止」——
+    /// 这是当时最该被看见的信息，而且直接复用标题那块的横向空间，不挤按钮。
+    @ViewBuilder
+    private var subtitleRow: some View {
+        if rec.isRecording {
+            Button { rec.stop() } label: {
+                HStack(spacing: S(4)) {
+                    Circle().fill(.white).frame(width: S(5), height: S(5))
+                    Text("录制中 \(rec.timerText)")
+                        .font(Fnt.s(9.5, .bold, .rounded)).monospacedDigit()
+                        .foregroundColor(.white)
+                    Text("停止")
+                        .font(Fnt.s(9.5, .semibold))
+                        .foregroundColor(.white.opacity(0.9))
+                        .padding(.horizontal, S(5)).padding(.vertical, 0)
+                        .background(Capsule().fill(Color.white.opacity(0.22)))
+                }
+                .padding(.horizontal, S(6)).padding(.vertical, S(2))
+                .background(Capsule().fill(Theme.redGradient))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("点这里结束录制")
+        } else {
+            HStack(spacing: 3) {
+                Image(systemName: "calendar.badge.clock")
+                    .font(Fnt.s(8.5, .semibold))
+                    .foregroundColor(Theme.sched.opacity(0.75))
+                Text(daySubtitle).font(Fnt.s(10))
+                    .foregroundColor(Theme.inkSoft)
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    /// 「功能」入口。子功能各自是独立窗口，所以这里只是把它们叫出来，
+    /// 不再需要「回到日历」——关掉那个窗口就回来了。
+    /// 以后再加能力（邮件摘要、审批）就是往这个菜单里多塞一行，主面板不用再改版式。
+    private var featureMenu: some View {
+        Menu {
+            ForEach(FeaturePane.allCases) { f in
+                Button { store.onOpenFeature?(f) } label: {
+                    Label(f.title, systemImage: f.icon)
+                }
+            }
+            Divider()
+            Button("回到今天") { backToToday() }
+            Button("打开数据文件夹") {
+                if let u = store.dataURL?.deletingLastPathComponent() {
+                    NSWorkspace.shared.open(u)
+                }
+            }
+            Divider()
+            Button("隐藏小组件") { store.onHide?() }
+            Button("退出书办") { NSApp.terminate(nil) }
+        } label: {
+            HStack(spacing: S(3)) {
+                Image(systemName: "square.grid.2x2")
+                    .font(.system(size: S(8), weight: .semibold))
+                Text("功能")
+                    .font(Fnt.s(8.5, .semibold))
+            }
+            .foregroundColor(Theme.goldDeep)
+            .padding(.horizontal, S(7))
+            .padding(.vertical, S(4))
+            .background(Capsule().fill(Theme.todo.opacity(0.16)))
+            .overlay(Capsule().stroke(Theme.todo.opacity(0.45), lineWidth: 0.8))
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("录屏、记事本等子功能")
+    }
+
+    private func backToToday() {
+        store.monthAnchor = cal.startOfDay(for: Date())
+        store.selectedDay = cal.startOfDay(for: Date())
     }
 
     /// 印章式标识：中国红方形 + 金边 + 白字
@@ -1301,36 +1363,6 @@ struct ContentView: View {
             .opacity(0.55)
             .padding(.horizontal, S(12))
             .padding(.top, S(5))   // 统计条没了，金线跟日历格之间补一点呼吸
-    }
-
-    private var moreMenu: some View {
-        // .menuStyle(.button) + .plain 按钮样式：不会像 borderlessButton 那样
-        // 在大缩放档画出额外的按钮盒子压到相邻翻页键上；.fixedSize 锁住固有尺寸
-        Menu {
-            Button("回到今天") {
-                store.monthAnchor = cal.startOfDay(for: Date())
-                store.selectedDay = cal.startOfDay(for: Date())
-            }
-            Button("打开数据文件夹") {
-                if let u = store.dataURL?.deletingLastPathComponent() {
-                    NSWorkspace.shared.open(u)
-                }
-            }
-            Divider()
-            Button("退出小组件") { NSApp.terminate(nil) }
-        } label: {
-            Image(systemName: "ellipsis")
-                .font(Fnt.s(12, .semibold))
-                .foregroundColor(Theme.inkSoft)
-                .frame(width: S(22), height: S(22))
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.05)))
-                .contentShape(Rectangle())
-        }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("更多操作")
     }
 
     private var monthTitle: String {
@@ -2419,58 +2451,13 @@ struct ContentView: View {
                 .foregroundColor(store.footerIsError(store.statusText) ? Theme.sched : Theme.inkSoft)
                 .lineLimit(1)
             Spacer(minLength: 0)
-            noteChip
-            recordChip
+            // 这里原来挂着「笔记」「录屏」两颗换页胶囊。子功能拆成独立窗口之后，
+            // 底栏就只该干底栏的事：报同步状态。入口在顶部那颗「功能」。
         }
         .padding(.horizontal, S(16))
         .padding(.vertical, S(7))
         .background(Theme.cream.opacity(0.92))
         .overlay(alignment: .top) { Theme.ribbon.frame(height: S(1)).opacity(0.45) }
-    }
-
-    /// 底栏的记事本入口。和录屏那颗并列，都是书办的子功能页。
-    private var noteChip: some View {
-        Button { store.mode = 2 } label: {
-            HStack(spacing: S(3)) {
-                Image(systemName: "square.and.pencil")
-                    .font(.system(size: S(8), weight: .semibold))
-                Text("笔记")
-                    .font(Fnt.s(8.5, .semibold))
-            }
-            .foregroundColor(Theme.goldDeep)
-            .padding(.horizontal, S(6))
-            .padding(.vertical, S(2))
-            .background(Capsule().fill(Theme.todo.opacity(0.16)))
-            .overlay(Capsule().stroke(Theme.todo.opacity(0.45), lineWidth: 0.8))
-        }
-        .buttonStyle(.plain)
-        .help("记事本 · 书办子功能")
-    }
-
-    /// 底栏右侧的录屏入口。录制中直接变成「计时 + 停止」，
-    /// 这样即使书办被别的窗口挡住，也能从底栏一键收尾（还有屏幕上的悬浮条兜底）。
-    private var recordChip: some View {
-        Button {
-            if rec.isRecording { rec.stop() } else { store.mode = 1 }
-        } label: {
-            HStack(spacing: S(3)) {
-                Circle()
-                    .fill(rec.isRecording ? Color.white : Theme.sched)
-                    .frame(width: S(5), height: S(5))
-                Text(rec.isRecording ? "\(rec.timerText) 停止" : "录屏")
-                    .font(Fnt.s(8.5, .semibold, rec.isRecording ? .rounded : .default))
-                    .monospacedDigit()
-                    .foregroundColor(rec.isRecording ? .white : Theme.sched)
-            }
-            .padding(.horizontal, S(6))
-            .padding(.vertical, S(2))
-            .background(Capsule().fill(rec.isRecording
-                ? AnyShapeStyle(Theme.redGradient)
-                : AnyShapeStyle(Theme.sched.opacity(0.10))))
-            .overlay(Capsule().stroke(Theme.sched.opacity(rec.isRecording ? 0 : 0.25), lineWidth: 0.8))
-        }
-        .buttonStyle(.plain)
-        .help(rec.isRecording ? "点这里结束录制" : "录屏 · 书办子功能")
     }
 
     private var footerText: String {
@@ -2511,6 +2498,9 @@ struct VisualEffectBackground: NSViewRepresentable {
 final class VisibleArea: @unchecked Sendable {
     static let shared = VisibleArea()
     var frame = NSRect(x: 0, y: 0, width: 1440, height: 900)
+    /// 每个窗口自己的宽高上下限。windowWillResize 在非隔离上下文里跑，
+    /// 读不到 MainActor 上的窗口对象，只能靠这张表（主线程写、主线程读）。
+    var limits: [ObjectIdentifier: (min: NSSize, max: NSSize)] = [:]
 }
 
 // MARK: - 应用入口
@@ -2552,75 +2542,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return g
     }
 
-    // MARK: 窗口尺寸持久化
+    // MARK: 窗口尺寸持久化（每个窗口一个 key）
 
     private static let frameKey = "wecal.frame"
-    private var saveFrameWork: DispatchWorkItem?
+    /// 窗口 → 存档 key。三个窗口各记各的，互不干扰。
+    /// 键用 ObjectIdentifier 而不是 windowNumber：后者在窗口上屏前是 0，会撞。
+    private var frameKeys: [ObjectIdentifier: String] = [:]
+    /// 窗口 → 落盘防抖任务。拖动三个窗口不能共用一个 work item
+    private var saveWorks: [ObjectIdentifier: DispatchWorkItem] = [:]
 
-    /// 记住窗口位置/大小
-    func saveFrame() {
-        guard let p = panel else { return }
-        let f = p.frame
-        guard f.width >= Self.minW - 1, f.height >= Self.minH - 1 else { return }
-        UserDefaults.standard.set(NSStringFromRect(f), forKey: Self.frameKey)
+    private func frameKey(of w: NSWindow) -> String {
+        frameKeys[ObjectIdentifier(w)] ?? Self.frameKey
+    }
+
+    /// 记住某个窗口的位置/大小
+    func saveFrame(_ w: NSWindow) {
+        let f = w.frame
+        // 太小的不存（拖到极限时中间帧可能是 1×1）
+        guard f.width > 120, f.height > 120 else { return }
+        UserDefaults.standard.set(NSStringFromRect(f), forKey: frameKey(of: w))
+    }
+
+    func saveAllFrames() {
+        for w in ([panel] + featurePanels.values).compactMap({ $0 }) { saveFrame(w) }
     }
 
     /// 拖动/缩放会连续回调，落盘推迟 0.6 秒，避免每次 mouseDragged 都写一遍
-    func scheduleSaveFrame() {
-        saveFrameWork?.cancel()
-        let w = DispatchWorkItem { [weak self] in self?.saveFrame() }
-        saveFrameWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: w)
+    func scheduleSaveFrame(_ w: NSWindow) {
+        let n = ObjectIdentifier(w)
+        saveWorks[n]?.cancel()
+        let item = DispatchWorkItem { [weak self, weak w] in
+            guard let self, let w else { return }
+            self.saveFrame(w)
+        }
+        saveWorks[n] = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: item)
     }
 
-    private func restoreFrame(_ p: NSWindow) {
+    /// 恢复窗口位置/大小。没有存档时：找得到参照窗口就挨着它摆，否则在屏幕上居中
+    private func restoreFrame(_ p: NSWindow, key: String, fallback: NSSize, near anchor: NSRect? = nil) {
         let vf = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        // 第二个来源是旧版本的 NSWindow autosave 键：尺寸正常就继承一次
-        let saved = [UserDefaults.standard.string(forKey: Self.frameKey),
-                     UserDefaults.standard.string(forKey: "NSWindow Frame WeComCalendarWidget")]
-        for s in saved.compactMap({ $0 }) {
+        // 第二个来源是旧版本的 NSWindow autosave 键：尺寸正常就继承一次（只对主面板有意义）
+        var sources = [UserDefaults.standard.string(forKey: key)]
+        if key == Self.frameKey {
+            sources.append(UserDefaults.standard.string(forKey: "NSWindow Frame WeComCalendarWidget"))
+        }
+        for s in sources.compactMap({ $0 }) {
             var f = NSRectFromString(s)
-            guard f.width >= Self.minW - 1, f.height >= Self.minH - 1 else { continue }
+            guard f.width > 120, f.height > 120 else { continue }
             // 恢复时也走一遍屏幕夹紧：老存档可能是「比可见区还高」的尺寸
             f = Self.fitToScreen(f, vf)
             p.setFrame(f, display: false)
             return
         }
-        p.setFrameOrigin(NSPoint(x: vf.maxX - width - 20, y: vf.maxY - height - 12))
-        p.setContentSize(NSSize(width: width, height: height))
+        // 无存档
+        if let a = anchor {
+            // 摆在参照窗口右侧；右边放不下就摆左侧；再不行居中
+            let gap: CGFloat = 12
+            var x = a.maxX + gap
+            if x + fallback.width > vf.maxX { x = a.minX - gap - fallback.width }
+            if x < vf.minX { x = vf.midX - fallback.width / 2 }
+            var y = min(a.maxY - fallback.height, vf.maxY - fallback.height)
+            y = max(y, vf.minY)
+            p.setFrame(NSRect(x: x, y: y, width: fallback.width, height: fallback.height), display: false)
+        } else {
+            p.setFrameOrigin(NSPoint(x: vf.maxX - fallback.width - 20, y: vf.maxY - fallback.height - 12))
+            p.setContentSize(fallback)
+        }
     }
 
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        // 验收钩子：记事本数据层的用例表，临时目录里跑，不建窗口
-        if ProcessInfo.processInfo.environment["WECAL_NOTES_TEST"] == "1" {
-            NoteStore.runSelfTest()   // 内部 exit(0/1)，不返回
-            return
-        }
-        NSApp.setActivationPolicy(.regular)
-        setupMainMenu()
+    // MARK: 窗口工厂
 
-        // 回调要在建窗口之前接好：SwiftUI 的 onAppear 可能在面板第一次上屏的那一刻就触发
-        // （录屏页一出现就会登记授权），接晚了那几条日志会丢。
-        recorder.onLog = { [weak self] line in self?.store.logUI(line) }
-        recorder.onRelaunch = { [weak self] in self?.store.markRelaunch() }
-
-        // 记事本要先定好目录再建窗口：面板一上屏就会读树，
-        // 配晚了第一帧会显示「还没有笔记」，看着像数据丢了。
-        notes.configure(projectDir: store.projectDir)
-
-        let host = BleedHostingView(rootView: ContentView()
-            .environmentObject(store)
-            .environmentObject(recorder)
-            .environmentObject(notes))
-        host.frame = NSRect(x: 0, y: 0, width: width, height: height)
-
+    /// 书办所有窗口共用一套外壳：透明背景、隐藏红绿灯、可拖背景移动、跟着切桌面。
+    /// 区别只在内容、尺寸和存档 key。
+    private func makePanel<Content: View>(title: String,
+                                          frameKey: String,
+                                          size: NSSize,
+                                          min: NSSize,
+                                          max: NSSize,
+                                          @ViewBuilder content: () -> Content) -> Panel {
+        let host = BleedHostingView(rootView: content())
+        host.frame = NSRect(origin: .zero, size: size)
         let p = Panel(contentRect: host.frame,
                       styleMask: [.titled, .resizable, .miniaturizable, .nonactivatingPanel, .fullSizeContentView],
                       backing: .buffered,
                       defer: false)
         p.delegate = self
+        p.title = title          // 标题栏是隐的，只用于内部识别
+        // 关掉只是隐藏：窗口对象留着，再打开时滚动位置、选中的笔记都还在原样
+        p.isReleasedWhenClosed = false
         host.autoresizingMask = [.width, .height]
         // 关键：不让 SwiftUI 内容的固有尺寸反过来当窗口下限，
         // 否则放大档下内容会顶住窗口，宽而扁的形态就缩不出来
@@ -2629,11 +2641,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         host.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         host.setContentHuggingPriority(.defaultLow, for: .horizontal)
         host.setContentHuggingPriority(.defaultLow, for: .vertical)
-        // 可自由拖拽缩放；上下限与 Fnt 的 0.8~2.0 缩放档对齐
-        p.contentMinSize = NSSize(width: Self.minW, height: Self.minH)
-        p.contentMaxSize = NSSize(width: Self.maxW, height: Self.maxH)
-        p.minSize = NSSize(width: Self.minW, height: Self.minH)
-        p.maxSize = NSSize(width: Self.maxW, height: Self.maxH)
+        p.contentMinSize = min
+        p.contentMaxSize = max
+        p.minSize = min
+        p.maxSize = max
         p.titlebarAppearsTransparent = true
         p.titleVisibility = .hidden
         p.standardWindowButton(.closeButton)?.isHidden = true
@@ -2654,11 +2665,107 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.hasShadow = true
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         p.contentView = host
+        frameKeys[ObjectIdentifier(p)] = frameKey
+        VisibleArea.shared.limits[ObjectIdentifier(p)] = (min: min, max: max)
+        return p
+    }
+
+    // MARK: 子功能窗口
+
+    /// 已建出来的子功能窗口。关掉只是 orderOut，引用留着 —— 再打开时状态还在。
+    private var featurePanels: [Int: Panel] = [:]
+
+    func featurePanel(_ f: FeaturePane) -> Panel? { featurePanels[f.rawValue] }
+
+    /// 叫出子功能窗口。已经开着就只提到前面，不重建 —— 重建会丢当前选中项和滚动位置。
+    @discardableResult
+    func openFeature(_ f: FeaturePane, front: Bool = true) -> Panel {
+        if let p = featurePanels[f.rawValue] {
+            if front {
+                if p.isMiniaturized { p.deminiaturize(nil) }
+                p.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            return p
+        }
+        let size = f.defaultSize
+        let p = makePanel(title: f == .record ? "record" : "notes",
+                          frameKey: f.frameKey,
+                          size: size,
+                          min: f.minSize,
+                          max: f.maxSize) {
+            Group {
+                if f == .record {
+                    RecordPanel()
+                } else {
+                    NotePanel()
+                }
+            }
+            .environmentObject(store)
+            .environmentObject(recorder)
+            .environmentObject(notes)
+            .environment(\.closeFeaturePane, { [weak self] in self?.closeFeature(f) })
+        }
+        // 第一次打开摆在主面板右边；摆不下就左边，再不行居中。之后按存档恢复
+        restoreFrame(p, key: f.frameKey, fallback: size, near: panel?.frame)
+        p.sharingType = recorder.isRecording ? .none : .readOnly
+        if store.pinned { p.level = .floating; p.isFloatingPanel = true }
+        featurePanels[f.rawValue] = p
+        if front {
+            p.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        store.logUI("打开\(f.title)窗口 \(Int(p.frame.width))×\(Int(p.frame.height))")
+        return p
+    }
+
+    func closeFeature(_ f: FeaturePane) {
+        guard let p = featurePanels[f.rawValue] else { return }
+        // 笔记的正文是 0.5 秒防抖落盘的，窗一藏 onDisappear 不一定来，这里补一刀
+        if f == .notes { notes.saveNow() }
+        saveFrame(p)
+        p.orderOut(nil)
+        store.logUI("关闭\(f.title)窗口")
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // 验收钩子：记事本数据层的用例表，临时目录里跑，不建窗口
+        if ProcessInfo.processInfo.environment["WECAL_NOTES_TEST"] == "1" {
+            NoteStore.runSelfTest()   // 内部 exit(0/1)，不返回
+            return
+        }
+        NSApp.setActivationPolicy(.regular)
+        setupMainMenu()
+
+        // 回调要在建窗口之前接好：SwiftUI 的 onAppear 可能在面板第一次上屏的那一刻就触发
+        // （录屏页一出现就会登记授权），接晚了那几条日志会丢。
+        recorder.onLog = { [weak self] line in self?.store.logUI(line) }
+        recorder.onRelaunch = { [weak self] in
+            guard let self else { return }
+            // 记下是从哪个窗口点的重启：回来要把它原样再开出来，否则看着像「没重启」
+            let key = NSApp.keyWindow
+            let pane = self.featurePanels.first { $0.value === key }.flatMap { FeaturePane(rawValue: $0.key) }
+            self.store.markRelaunch(from: pane)
+        }
+
+        // 记事本要先定好目录再建窗口：面板一上屏就会读树，
+        // 配晚了第一帧会显示「还没有笔记」，看着像数据丢了。
+        notes.configure(projectDir: store.projectDir)
+
+        let p = makePanel(title: "main", frameKey: Self.frameKey,
+                          size: NSSize(width: width, height: height),
+                          min: NSSize(width: Self.minW, height: Self.minH),
+                          max: NSSize(width: Self.maxW, height: Self.maxH)) {
+            ContentView()
+                .environmentObject(store)
+                .environmentObject(recorder)
+                .environmentObject(notes)
+        }
 
         // 只有首次启动（无历史尺寸）才用默认尺寸；否则保留用户拖拽后的宽高。
         // 尺寸自己存（用户默认值 wecal.frame），不用 NSWindow 的 autosave ——
         // autosave 在每次 frame 变化时都会写，保存时机完全不受控。
-        restoreFrame(p)
+        restoreFrame(p, key: Self.frameKey, fallback: NSSize(width: width, height: height))
         // 验收用钩子：WECAL_SIZE="480x700" 直接指定内容尺寸（仅调试时用，正常启动不设该变量）
         if let spec = ProcessInfo.processInfo.environment["WECAL_SIZE"] {
             let parts = spec.lowercased().split(separator: "x").compactMap { Double($0) }
@@ -2684,15 +2791,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 录制期间把书办主面板也标成「不参与屏幕采集」：界面照常看得见，
         // 但成片里不会出现（sharingType 就是系统为这事留的正门）。
         recorder.mainWindow = p
+        // 录制期间书办的每个窗口都不该进画面：主面板、录屏窗、笔记窗一视同仁
         recorder.onRecordingStateChange = { [weak self] active in
-            self?.panel?.sharingType = active ? .none : .readOnly
+            guard let self else { return }
+            self.panel?.sharingType = active ? .none : .readOnly
+            for w in self.featurePanels.values { w.sharingType = active ? .none : .readOnly }
         }
         // 出成片了把面板叫回前台，别让用户对着桌面找文件
         recorder.onPresentResult = { [weak self] in
             guard let self else { return }
-            self.store.mode = 1
-            self.panel?.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            self.openFeature(.record)
         }
         // 「重启」这类动作必须留痕：事后只看界面是分不清「没点到」「点了没生效」的
         // （回调已在 applicationDidFinishLaunching 开头接好，这里不再重复赋值）
@@ -2841,7 +2949,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 验收钩子：WECAL_REC_CHECK=1 无界面跑一遍自检（录 2 秒测试片段 + 体检），
         // 把结论行打到 stdout 后退出。用来区分「采集通道坏了」和「停止阶梯坏了」。
         if ProcessInfo.processInfo.environment["WECAL_REC_CHECK"] == "1" {
-            store.mode = 1
             // 自检纯粹是后台探测，没必要在桌面上闪一个面板（菲哥正在干活）
             panel?.orderOut(nil)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
@@ -2855,7 +2962,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 用来非交互地验证「权限 → 采集 → 阶梯停止 → 封装 → 自检」整条链路，
         // 以及最关键的一条：书办自己和悬浮条到底有没有从成片里排掉。
         if let s = ProcessInfo.processInfo.environment["WECAL_REC_TEST"], let secs = Double(s), secs > 0 {
-            store.mode = 1
             recorder.countdownOverride = 0
             recorder.revealOverride = false
             recorder.onPresentResult = nil
@@ -2864,18 +2970,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 print("REC_TEST 权限预检 granted=\(Media.screenGranted) "
                       + "残留会话=\(Media.strayCaptures().count) ffmpeg=\(Media.ffmpeg ?? "无")")
                 self.recorder.start()
-                // 立刻把面板拉到最前并让它铺在浏览器窗口之上，整段录制里它都在最上层。
-                // 它要是被别的窗口挡着，「成片里没有它」就只能证明被挡了，证不了被排除。
-                // 验收期把面板提到 .floating：只在验收里这么干，正常使用仍留在 .normal
-                // （用户应该能用别的窗口把书办盖住）。提到最高层之后，
-                // 「成片里没有它」才排除了「被别的窗口挡住」这个解释。
-                self.panel.level = .floating
-                // 对抗性对照：WECAL_REC_SHOW=1 时把面板切回可被采集，
+                // 要验的是「录屏窗不进画面」，所以把录屏窗单独提出来当被试。
+                // 立刻把它拉到最前并铺在别的窗口之上，整段录制里它都在最上层 ——
+                // 它要是被挡住，「成片里没有它」就只能证明被挡了，证不了被排除。
+                // 验收期把窗口提到 .floating：只在验收里这么干，正常使用仍留在 .normal
+                let recWin = self.openFeature(.record)
+                self.panel.orderOut(nil)   // 主面板退场，画面里只留录屏窗
+                recWin.level = .floating
+                // 对抗性对照：WECAL_REC_SHOW=1 时把窗口切回可被采集，
                 // 它必须出现在成片里 —— 这样才证明「看不见」是排除生效，而不是测试本身看不见。
                 if ProcessInfo.processInfo.environment["WECAL_REC_SHOW"] == "1" {
-                    self.panel.sharingType = .readOnly
+                    recWin.sharingType = .readOnly
                 }
-                self.panel.makeKeyAndOrderFront(nil)
+                recWin.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
                 DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
                     guard let self else { return }
@@ -2886,8 +2993,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         NSApp.terminate(nil)
                         return
                     }
-                    print("REC_TEST 录制中，面板 frame=\(self.panel.frame) "
-                          + "sharingType=\(String(describing: self.panel.sharingType)) "
+                    print("REC_TEST 录制中，录屏窗 frame=\(recWin.frame) "
+                          + "sharingType=\(String(describing: recWin.sharingType)) "
                           + "level=floating 悬浮条=\(self.recorder.hudVisible ? "在" : "无") "
                           + "对照=\(ProcessInfo.processInfo.environment["WECAL_REC_SHOW"] == "1" ? "面板应可见" : "面板应不可见")")
                     self.recorder.stop()
@@ -2923,7 +3030,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 say("RELAUNCH_TEST 第 2 个实例（标记文件在）：退回正常启动 pid=\(ProcessInfo.processInfo.processIdentifier)")
             } else {
                 FileManager.default.createFile(atPath: mark, contents: Data())
-                store.mode = 1
+                _ = openFeature(.record)
                 say("RELAUNCH_TEST 旧 pid=\(ProcessInfo.processInfo.processIdentifier) 2.5 秒后点重启")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
                     say("RELAUNCH_TEST 触发 relaunch()")
@@ -2936,6 +3043,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self = self, let p = self.panel else { return }
             p.miniaturize(nil)
         }
+        store.onOpenFeature = { [weak self] f in self?.openFeature(f) }
         setupStatusItem()
         store.startWatching()
         store.startReminders()
@@ -2944,12 +3052,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store.startAutoSync()
         installReturnMonitor()
         installPasteMonitor()
-        // 刚点过「重启书办」：等界面稳住再把面板摆到前面，否则重启成功了也像「什么都没发生」
+        // 重启回来 / WECAL_MODE 指定：把那个子功能窗口按原样再开出来
+        if let f = store.reopenPane {
+            openFeature(f)
+            store.logUI("重启回来 → 重新打开\(f.title)窗口")
+        }
+        // 刚点过「重启书办」：等界面稳住再把窗口摆到前面，否则重启成功了也像「什么都没发生」
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
             guard let self, self.store.justRelaunched else { return }
-            self.panel?.makeKeyAndOrderFront(nil)
+            self.bringToFront()
             NSApp.activate(ignoringOtherApps: true)
-            self.store.logUI("重启完成：落在第 \(modeName(self.store.mode)) 页，面板已展开")
+            self.store.logUI("重启完成：日历窗已展开")
         }
 
         // 验收钩子：真往正文里按一次回车，看它有没有变成换行。
@@ -2960,16 +3073,110 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.runNotesEnterTest()
             }
         }
+
+        // 验收钩子：验「入口叫得出窗口、关掉不丢状态、各窗尺寸互不干扰」。
+        // 子功能从主面板的一个态改成独立窗口之后，这三件事光读代码看不出来 ——
+        // 尤其「关掉再开」如果变成重建，用户刚选中的笔记、滚到的位置会静悄悄丢掉。
+        if ProcessInfo.processInfo.environment["WECAL_FEATURE_TEST"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.runFeatureTest()
+            }
+        }
+    }
+
+    /// 子功能窗口的验收：菜单 ⌘1/⌘2/⌘3 的挂法、开关是否复用同一个窗口、
+    /// 各窗上下限与「改一个窗不带崩另一个窗」。
+    private func runFeatureTest() {
+        var pass = 0, fail = 0
+        func check(_ ok: Bool, _ label: String) {
+            say(ok ? "  ✓ \(label)" : "  ✗ \(label)")
+            if ok { pass += 1 } else { fail += 1 }
+        }
+        func sel(_ f: FeaturePane) -> Selector { f == .record ? #selector(showRecord) : #selector(showNotes) }
+        say("== 子功能窗口用例 ==")
+
+        // 1) 主菜单的键位：⌘1 日历 / ⌘2 录屏 / ⌘3 记事本
+        let appSub = NSApp.mainMenu?.items.first?.submenu
+        let wanted: [(String, Selector, String)] = [
+            ("1", #selector(showCalendar), "日历"),
+            ("2", #selector(showRecord), "录屏"),
+            ("3", #selector(showNotes), "记事本"),
+        ]
+        for (key, want, name) in wanted {
+            let it = appSub?.items.first { $0.keyEquivalent == key }
+            let got = it.flatMap { NSStringFromSelector($0.action ?? Selector(("无"))) } ?? "没有这一项"
+            check(it?.title == name && it?.action == want && it?.target is AppDelegate,
+                  "主菜单 ⌘\(key) 挂的是\(name)（实际标题「\(it?.title ?? "—")」动作\(got)）")
+        }
+
+        // 2) 走菜单动作真开一遍，顺便看尺寸有没有被夹在自己的上下限里
+        for f in FeaturePane.allCases {
+            guard let it = appSub?.items.first(where: { $0.action == sel(f) }) else {
+                check(false, "主菜单里找不到\(f.title)入口")
+                continue
+            }
+            NSApp.sendAction(it.action!, to: it.target, from: it)
+            guard let p = featurePanel(f) else { check(false, "\(f.title)窗口没建出来"); continue }
+            let s = p.frame.size
+            check(p.isVisible, "点菜单叫出\(f.title)窗口（\(Int(s.width))×\(Int(s.height))）")
+            check(s.width >= f.minSize.width - 1, "\(f.title)窗口没小于下限（\(Int(f.minSize.width))×\(Int(f.minSize.height))）")
+            check(s.width <= f.maxSize.width + 1 && s.height <= f.maxSize.height + 1,
+                  "\(f.title)窗口没超上限（\(Int(f.maxSize.width))×\(Int(f.maxSize.height))）")
+        }
+
+        // 3) 关掉再打开：必须是同一个窗口对象（复用 = 状态还在），不是重建
+        for f in FeaturePane.allCases {
+            guard let first = featurePanel(f) else { check(false, "\(f.title)窗口不在"); continue }
+            closeFeature(f)
+            check(!first.isVisible, "关掉\(f.title)窗口 → 收起来了（不是销毁）")
+            let again = openFeature(f)
+            check(again === first, "再打开\(f.title)还是原来那个窗口，没重建 → 选中项/滚动位置不丢")
+            check(again.isVisible, "\(f.title)窗口重新显示")
+        }
+
+        // 4) 状态栏菜单（右键图标那个）：两个入口都在，且 on/off 跟着窗口开合走
+        let sb = buildStatusMenu()
+        for f in FeaturePane.allCases {
+            let it = sb.items.first { $0.action == sel(f) }
+            check(it?.target is AppDelegate, "状态栏菜单里有「\(f.title)」且能点")
+            check(it?.state == NSControl.StateValue.on,
+                  "开着\(f.title)时状态栏那项是勾选态")
+            closeFeature(f)
+            let off = buildStatusMenu().items.first { $0.action == sel(f) }
+            check(off?.state == NSControl.StateValue.off, "关掉\(f.title)后勾选态跟着取消")
+            openFeature(f)
+        }
+
+        // 5) 各窗尺寸互不干扰，也不把主面板的字号档带走
+        if let rec = featurePanel(.record), let nt = featurePanel(.notes) {
+            let beforeNotes = nt.frame
+            let beforeZoom = store.zoom
+            rec.setFrame(NSRect(x: rec.frame.origin.x, y: rec.frame.origin.y, width: 560, height: 760),
+                         display: true)
+            check(nt.frame == beforeNotes, "拖动录屏窗改尺寸，记事本窗不动")
+            check(abs(store.zoom - beforeZoom) < 0.008, "改子窗尺寸不改主面板字号档（\(beforeZoom)）")
+        }
+
+        say("== 结果：\(pass) 通过 / \(fail) 失败 ==")
+        exit(fail == 0 ? 0 : 1)
     }
 
     /// 找到 TextEditor 背后的 NSTextView，塞一句话，投一个真回车，看结果是不是换行
-    private func runNotesEnterTest() {
-        guard let p = panel else { say("FAIL 没有窗口"); exit(1) }
+    /// retry：记事本现在是独立窗口，刚 open 出来的那一两帧里 SwiftUI 还没把
+    /// TextEditor 挂上（contentView 有、NSTextView 没有），所以要等它长出来
+    private func runNotesEnterTest(retry: Int = 0) {
+        let p = openFeature(.notes)     // 记事本现在是独立窗口，没开就开出来
         p.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         guard let tv = Self.findTextView(p.contentView) else {
-            say("FAIL 没找到正文背后的 NSTextView（页面在第 \(modeName(store.mode)) 页）")
-            exit(1)
+            guard retry < 10 else {
+                say("FAIL 没找到正文背后的 NSTextView（记事本窗口 contentView=\(p.contentView == nil ? "无" : "有")）")
+                exit(1)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                self?.runNotesEnterTest(retry: retry + 1)
+            }
+            return
         }
         p.makeFirstResponder(tv)
         tv.string = "第一行"
@@ -2997,7 +3204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             let s = tv.string
             let ok = s.contains("\n")
-            if ok { say("  ✓ 回车在正文里是换行，没被底栏监视器吃掉") }
+            if ok { say("  ✓ 回车在正文里是换行，没被回车监视器吃掉") }
             else { say("  ✗ 回车被吃掉了，正文还是 \(s.debugDescription)") }
             say("== 结果：\(ok ? "1 通过 / 0 失败" : "0 通过 / 1 失败") ==")
             exit(ok ? 0 : 1)
@@ -3061,10 +3268,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     ///   · 没在组字 → 直接提交并吞掉事件，避免和 onSubmit 重复触发
     private func installReturnMonitor() {
         returnMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            // 只管日历窗这一个窗口。记事本是独立窗口了（2026-11-22 重构），它的
+            // TextEditor 里回车就是换行，绝不能落到这个监视器手里 —— 一接管，正文
+            // 就永远打不出第二段。这里按「事件是哪个窗口的」认人，而不是按
+            // 「首响应者是不是 NSTextView」：TextEditor 背后也是 NSTextView，认不出来。
+            // 已验证：改成不按窗口认人，WECAL_NOTES_ENTER_TEST 立刻变红（回车被吃掉）。
             guard let self, let panel = self.panel, e.window === panel else { return e }
-            // 笔记页的编辑区是 TextEditor，回车就是换行。这里一接管，正文就永远打不出
-            // 第二段 —— 所以整页豁免，交还给编辑器自己处理。
-            guard self.store.mode != 2 else { return e }
             guard e.keyCode == 36 || e.keyCode == 76 else { return e }          // Return / Enter
             guard e.modifierFlags.intersection([.command, .option, .control]).isEmpty else { return e }
             // 只有焦点在文本输入框（field editor 是 NSTextView）时才接管
@@ -3087,8 +3296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 正文照常粘文字，两种操作不打架。
     private func installPasteMonitor() {
         pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            guard let self, let panel = self.panel, e.window === panel else { return e }
-            guard self.store.mode == 2 else { return e }
+            guard let self, let notesWin = self.featurePanel(.notes), e.window === notesWin else { return e }
             let cmd = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
             guard cmd.contains(.command), cmd.intersection([.option, .control]).isEmpty else { return e }
             guard e.charactersIgnoringModifiers?.lowercased() == "v" else { return e }
@@ -3099,7 +3307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        saveFrame()
+        saveAllFrames()
         recorder.shutdownSync()
         // 笔记的落盘是 0.7 秒防抖的，退出前必须补一刀，否则最后几个字会丢
         notes.saveNow()
@@ -3109,32 +3317,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let m = pasteMonitor { NSEvent.removeMonitor(m); pasteMonitor = nil }
     }
 
-    /// 拖拽缩放时的尺寸闸门：contentMinSize 在 fullSizeContentView 下不生效，改为手动夹紧
+    /// 拖拽缩放时的尺寸闸门：contentMinSize 在 fullSizeContentView 下不生效，改为手动夹紧。
+    /// 每个窗口的上下限不一样（日历 320~768 宽，记事本最宽能到 1200），
+    /// 所以按窗口从非隔离的 limits 表里取，不能再写死 AppDelegate.minW。
     nonisolated func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
         // 这里不能直接读 sender.screen —— NSWindow.screen 是 MainActor 的，
         // 而本回调在非隔离上下文（AppKit 实际就在主线程调它）。读主线程写好的中转值。
         let vf = VisibleArea.shared.frame
-        let upperW = max(AppDelegate.minW, min(AppDelegate.maxW, vf.width))
-        let upperH = max(AppDelegate.minH, min(AppDelegate.maxH, vf.height))
-        return NSSize(width: min(max(frameSize.width, AppDelegate.minW), upperW),
-                      height: min(max(frameSize.height, AppDelegate.minH), upperH))
+        let lim = VisibleArea.shared.limits[ObjectIdentifier(sender)]
+            ?? (min: NSSize(width: AppDelegate.minW, height: AppDelegate.minH),
+                max: NSSize(width: AppDelegate.maxW, height: AppDelegate.maxH))
+        let upperW = max(lim.min.width, min(lim.max.width, vf.width))
+        let upperH = max(lim.min.height, min(lim.max.height, vf.height))
+        return NSSize(width: min(max(frameSize.width, lim.min.width), upperW),
+                      height: min(max(frameSize.height, lim.min.height), upperH))
     }
 
-    /// 拖拽缩放时同步全局缩放档（字号与固定尺寸随之重排）
+    /// 缩放：只有日历窗驱动全局字号档，子功能窗口用各自固定的字号（PZ/PF）
     nonisolated func windowDidResize(_ notification: Notification) {
         Task { @MainActor [weak self] in
-            guard let self, let f = self.panel?.contentView?.frame else { return }
-            self.store.applyZoom(f.width, f.height)
-            self.scheduleSaveFrame()
+            guard let self, let w = notification.object as? NSWindow, let cv = w.contentView else { return }
+            if w === self.panel { self.store.applyZoom(cv.frame.width, cv.frame.height) }
+            self.scheduleSaveFrame(w)
         }
     }
 
     /// 拖到别的显示器上时可见区会变，同步给非隔离的 windowWillResize
     nonisolated func windowDidMove(_ notification: Notification) {
         Task { @MainActor [weak self] in
-            guard let self, let p = self.panel else { return }
-            if let vf = (p.screen ?? NSScreen.main)?.visibleFrame { VisibleArea.shared.frame = vf }
-            self.scheduleSaveFrame()
+            guard let self, let w = notification.object as? NSWindow else { return }
+            if w === self.panel, let vf = (w.screen ?? NSScreen.main)?.visibleFrame {
+                VisibleArea.shared.frame = vf
+            }
+            self.scheduleSaveFrame(w)
         }
     }
 
@@ -3150,6 +3365,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let showHide = sub.addItem(withTitle: "显示 / 隐藏小组件", action: #selector(toggleVisibility), keyEquivalent: "")
         showHide.target = self
+
+        sub.addItem(.separator())
+
+        // 子功能都是独立窗口，⌘1/⌘2/⌘3 直接叫出来，比翻菜单快
+        let cal = sub.addItem(withTitle: "日历", action: #selector(showCalendar), keyEquivalent: "1")
+        cal.target = self
+        for f in FeaturePane.allCases {
+            let it = sub.addItem(withTitle: f.title,
+                                 action: f == .record ? #selector(showRecord) : #selector(showNotes),
+                                 keyEquivalent: "\(f.rawValue + 1)")
+            it.target = self
+        }
+
+        sub.addItem(.separator())
 
         let refresh = sub.addItem(withTitle: "刷新企微数据", action: #selector(doRefresh), keyEquivalent: "r")
         refresh.target = self
@@ -3214,17 +3443,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    /// 把小组件提到最前（含从最小化/被遮挡状态恢复）
+    /// 把窗口提到最前（含从最小化/被遮挡状态恢复）。子功能窗口开着就一起提，
+    /// 否则从别的应用切回来时它们会被压在主面板底下，看着像丢了。
     func bringToFront() {
         guard let p = panel else { return }
         if p.isMiniaturized { p.deminiaturize(nil) }
         p.orderFrontRegardless()
+        for w in featurePanels.values where w.isVisible {
+            if w.isMiniaturized { w.deminiaturize(nil) }
+            w.orderFrontRegardless()
+        }
     }
 
     @objc private func togglePin() {
         store.pinned.toggle()
-        panel.level = store.pinned ? .floating : .normal
-        panel.isFloatingPanel = store.pinned
+        for w in ([panel] + featurePanels.values).compactMap({ $0 }) {
+            w.level = store.pinned ? .floating : .normal
+            w.isFloatingPanel = store.pinned
+        }
     }
 
     @objc private func doTestReminder() {
@@ -3241,11 +3477,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                    duration: 30)
     }
 
+    @objc private func showCalendar() {
+        bringToFront()
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    @objc private func showRecord() { openFeature(.record) }
+    @objc private func showNotes() { openFeature(.notes) }
+
     @objc private func doRefresh() { store.refresh() }
     @objc private func doQuit() { NSApp.terminate(nil) }
 
+    /// 右键图标时的菜单。每次现建 —— 「显示/隐藏」「置顶」「哪些子窗开着」都是即时状态。
+    /// 构建和弹出分成两段，是为了让 WECAL_FEATURE_TEST 能在不弹菜单的情况下检查里面有什么。
     private func showStatusMenu() {
         guard let b = statusItem?.button else { return }
+        let menu = buildStatusMenu()
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: b.bounds.height + 4), in: b)
+    }
+
+    private func buildStatusMenu() -> NSMenu {
         let menu = NSMenu()
 
         let showHide = menu.addItem(withTitle: (panel.isVisible && !panel.isMiniaturized) ? "隐藏小组件" : "显示小组件",
@@ -3255,6 +3505,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let pin = menu.addItem(withTitle: "窗口置顶", action: #selector(togglePin), keyEquivalent: "")
         pin.target = self
         pin.state = store.pinned ? .on : .off
+
+        menu.addItem(.separator())
+
+        for f in FeaturePane.allCases {
+            let it = menu.addItem(withTitle: f.title,
+                                  action: f == .record ? #selector(showRecord) : #selector(showNotes),
+                                  keyEquivalent: "")
+            it.target = self
+            it.image = NSImage(systemSymbolName: f.icon, accessibilityDescription: f.title)
+            it.state = featurePanel(f)?.isVisible == true ? .on : .off
+        }
 
         menu.addItem(.separator())
 
@@ -3269,7 +3530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let quit = menu.addItem(withTitle: "退出", action: #selector(doQuit), keyEquivalent: "q")
         quit.target = self
 
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: b.bounds.height + 4), in: b)
+        return menu
     }
 }
 
