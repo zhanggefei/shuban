@@ -4,15 +4,34 @@
 //
 //  独立录屏工具那套「墨蓝 + 电光蓝」的深色界面整体舍弃，全部改用书办的语言：
 //  宣纸暖白打底、中国红主色、金线点缀、宋体印章、字号统一走 Fnt/S 的缩放体系。
-//  形态上也刻意不另开窗口 —— 它就是书办面板的一个态，和「日程 / 待办」并列，
-//  从底栏那颗红点进来，从左上角回去。
+//  形态上：它是独立窗口（2026-11-22 重构），不再是主面板的一个态。
+//  录屏的内容是一列竖排设置卡，要窄而高；主面板是日历，要方。挤在一个壳里谁都别扭。
+//  从主面板顶部的「功能」菜单进来，左上角 ✕ 关掉。
 //
 
 import SwiftUI
 import AppKit
 
+// MARK: - 这一页自己的字号与尺寸档
+
+/// 录屏窗口是独立窗口，尺寸自己定（默认 420×640），所以不再跟随主面板的全局缩放档
+/// —— 那个档位是主面板宽度的函数，两个窗口各拖各的会互相抢。
+/// 这里给录屏窗钉一个固定档，窗口拉大时只是留白变多，字号不动。
+private let panelZoom: CGFloat = 1.05
+
+/// 长度：把基准版的固定尺寸换算到本窗口的档位
+@inline(__always)
+private func PZ(_ v: CGFloat) -> CGFloat { v * panelZoom }
+
+/// 字号：同 PZ，但直接产出 Font
+private func PF(_ size: CGFloat,
+                _ weight: Font.Weight = .regular,
+                _ design: Font.Design = .default) -> Font {
+    .system(size: (size * panelZoom * 2).rounded() / 2, weight: weight, design: design)
+}
+
 struct RecordPanel: View {
-    @EnvironmentObject var store: Store
+    @Environment(\.closeFeaturePane) private var closePane
     @EnvironmentObject var rec: Recorder
     /// 最近三条成片。面板高的时候下面本来是一片空白，拿它填上既有用又不打乱布局
     @State private var recents: [RecentClip] = []
@@ -22,12 +41,12 @@ struct RecordPanel: View {
             header
             ribbonDivider
             ScrollView(showsIndicators: false) {
-                VStack(spacing: S(9)) {
+                VStack(spacing: PZ(9)) {
                     content
                 }
-                .padding(.horizontal, S(13))
-                .padding(.top, S(10))
-                .padding(.bottom, S(14))
+                .padding(.horizontal, PZ(13))
+                .padding(.top, PZ(10))
+                .padding(.bottom, PZ(14))
             }
             footer
         }
@@ -45,64 +64,64 @@ struct RecordPanel: View {
 
     private var header: some View {
         VStack(spacing: 0) {
-            Theme.ribbon.frame(height: S(3))
-            HStack(alignment: .center, spacing: S(9)) {
-                Button { store.mode = 0 } label: {
-                    Image(systemName: "chevron.left")
-                        .font(Fnt.s(11, .bold))
+            Theme.ribbon.frame(height: PZ(3))
+            HStack(alignment: .center, spacing: PZ(9)) {
+                Button { closePane() } label: {
+                    Image(systemName: "xmark")
+                        .font(PF(11, .bold))
                         .foregroundColor(Theme.inkSoft)
-                        .frame(width: S(22), height: S(22))
+                        .frame(width: PZ(22), height: PZ(22))
                         .background(Circle().fill(Color.black.opacity(0.05)))
                 }
                 .buttonStyle(.plain)
-                .help("回到日历")
+                .help("关闭录屏窗口")
 
                 ZStack {
-                    RoundedRectangle(cornerRadius: S(8), style: .continuous)
+                    RoundedRectangle(cornerRadius: PZ(8), style: .continuous)
                         .fill(Theme.redGradient)
-                        .frame(width: S(29), height: S(29))
-                        .shadow(color: Theme.redDeep.opacity(0.45), radius: S(3), y: S(1.5))
-                    RoundedRectangle(cornerRadius: S(8), style: .continuous)
+                        .frame(width: PZ(29), height: PZ(29))
+                        .shadow(color: Theme.redDeep.opacity(0.45), radius: PZ(3), y: PZ(1.5))
+                    RoundedRectangle(cornerRadius: PZ(8), style: .continuous)
                         .strokeBorder(Theme.todo.opacity(0.75), lineWidth: 0.9)
-                        .frame(width: S(26), height: S(26))
+                        .frame(width: PZ(26), height: PZ(26))
                     Text("录")
-                        .font(Fnt.s(15, .bold, .serif))
+                        .font(PF(15, .bold, .serif))
                         .foregroundColor(.white)
-                        .offset(y: S(-0.5))
+                        .offset(y: PZ(-0.5))
                 }
 
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        Text("录 屏").font(Fnt.s(21, .heavy, .rounded)).foregroundColor(Theme.sched)
+                        Text("录 屏").font(PF(21, .heavy, .rounded)).foregroundColor(Theme.sched)
                         Text("书办子功能")
-                            .font(Fnt.s(8.5, .semibold, .rounded))
+                            .font(PF(8.5, .semibold, .rounded))
                             .foregroundColor(Theme.goldDeep)
-                            .padding(.horizontal, S(4))
-                            .padding(.vertical, S(1))
+                            .padding(.horizontal, PZ(4))
+                            .padding(.vertical, PZ(1))
                             .background(Capsule().fill(Theme.todo.opacity(0.18)))
                     }
                     HStack(spacing: 3) {
                         Image(systemName: "record.circle")
-                            .font(Fnt.s(8.5, .semibold))
+                            .font(PF(8.5, .semibold))
                             .foregroundColor(Theme.sched.opacity(0.75))
-                        Text(subTitle).font(Fnt.s(10)).foregroundColor(Theme.inkSoft).lineLimit(1)
+                        Text(subTitle).font(PF(10)).foregroundColor(Theme.inkSoft).lineLimit(1)
                     }
                 }
                 Spacer(minLength: 0)
                 if rec.isRecording {
-                    HStack(spacing: S(4)) {
-                        Circle().fill(.white).frame(width: S(5), height: S(5))
+                    HStack(spacing: PZ(4)) {
+                        Circle().fill(.white).frame(width: PZ(5), height: PZ(5))
                         Text(rec.timerText)
-                            .font(Fnt.s(12, .bold, .rounded)).monospacedDigit()
+                            .font(PF(12, .bold, .rounded)).monospacedDigit()
                             .foregroundColor(.white)
                     }
-                    .padding(.horizontal, S(7)).padding(.vertical, S(3))
+                    .padding(.horizontal, PZ(7)).padding(.vertical, PZ(3))
                     .background(Capsule().fill(Theme.redGradient))
                 }
             }
-            .padding(.horizontal, S(13))
-            .padding(.top, S(8))
-            .padding(.bottom, S(7))
+            .padding(.horizontal, PZ(13))
+            .padding(.top, PZ(8))
+            .padding(.bottom, PZ(7))
         }
     }
 
@@ -112,7 +131,7 @@ struct RecordPanel: View {
     }
 
     private var ribbonDivider: some View {
-        Theme.ribbon.frame(height: S(1.2)).opacity(0.55).padding(.horizontal, S(12))
+        Theme.ribbon.frame(height: PZ(1.2)).opacity(0.55).padding(.horizontal, PZ(12))
     }
 
     // MARK: 主体按阶段切换
@@ -144,19 +163,19 @@ struct RecordPanel: View {
 
     private var permCard: some View {
         card(tint: Theme.todo.opacity(0.12), border: Theme.todo.opacity(0.45)) {
-            VStack(alignment: .leading, spacing: S(6)) {
-                HStack(spacing: S(5)) {
+            VStack(alignment: .leading, spacing: PZ(6)) {
+                HStack(spacing: PZ(5)) {
                     Image(systemName: "lock.shield.fill")
-                        .font(Fnt.s(11)).foregroundColor(Theme.goldDeep)
-                    Text("需要「屏幕录制」权限").font(Fnt.s(11, .bold)).foregroundColor(Theme.ink)
+                        .font(PF(11)).foregroundColor(Theme.goldDeep)
+                    Text("需要「屏幕录制」权限").font(PF(11, .bold)).foregroundColor(Theme.ink)
                 }
                 Text(" macOS 的规定：勾上之后必须重启书办才生效。授权一次，以后不用再管。")
-                    .font(Fnt.s(9.5)).foregroundColor(Theme.inkSoft).fixedSize(horizontal: false, vertical: true)
+                    .font(PF(9.5)).foregroundColor(Theme.inkSoft).fixedSize(horizontal: false, vertical: true)
                 Text("在「系统设置 → 隐私与安全性 → 屏幕录制」里勾上「书办」，再点「重启书办」。"
                      + "列表里没有它就先点「去开启」。勾上了这里会在两秒内自动消失。")
-                    .font(Fnt.s(9)).foregroundColor(Theme.inkSoft.opacity(0.85))
+                    .font(PF(9)).foregroundColor(Theme.inkSoft.opacity(0.85))
                     .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: S(6)) {
+                HStack(spacing: PZ(6)) {
                     ghostButton("去开启", icon: "arrow.up.forward.square") {
                         rec.openPrivacy("Privacy_ScreenCapture")
                     }
@@ -168,18 +187,18 @@ struct RecordPanel: View {
 
     private var rangeCard: some View {
         card {
-            VStack(alignment: .leading, spacing: S(7)) {
+            VStack(alignment: .leading, spacing: PZ(7)) {
                 sectionLabel("录制范围", right: rec.targetText)
-                HStack(spacing: S(5)) {
+                HStack(spacing: PZ(5)) {
                     ForEach(RecRange.allCases) { r in rangeChip(r) }
                 }
-                Text(hintText).font(Fnt.s(9)).foregroundColor(Theme.inkSoft)
+                Text(hintText).font(PF(9)).foregroundColor(Theme.inkSoft)
                     .fixedSize(horizontal: false, vertical: true)
                 if rec.range == .region {
-                    HStack(spacing: S(6)) {
+                    HStack(spacing: PZ(6)) {
                         if let rg = rec.region {
                             Text("已框选 \(Int(rg.width)) × \(Int(rg.height))")
-                                .font(Fnt.s(9.5, .semibold, .rounded))
+                                .font(PF(9.5, .semibold, .rounded))
                                 .foregroundColor(Theme.goldDeep)
                         }
                         ghostButton(rec.region == nil ? "框选区域" : "重新框选",
@@ -201,20 +220,20 @@ struct RecordPanel: View {
         return Button {
             if r == .region && rec.region == nil { rec.pickRegion() } else { rec.range = r }
         } label: {
-            VStack(spacing: S(2)) {
+            VStack(spacing: PZ(2)) {
                 Image(systemName: icon(r))
-                    .font(Fnt.s(11, .semibold))
-                Text(r.label).font(Fnt.s(10, on ? .bold : .medium))
+                    .font(PF(11, .semibold))
+                Text(r.label).font(PF(10, on ? .bold : .medium))
             }
             .foregroundColor(on ? .white : (dead ? Theme.inkSoft.opacity(0.45) : Theme.inkSoft))
             .frame(maxWidth: .infinity)
-            .padding(.vertical, S(8))
+            .padding(.vertical, PZ(8))
             .background(
-                RoundedRectangle(cornerRadius: S(10), style: .continuous)
+                RoundedRectangle(cornerRadius: PZ(10), style: .continuous)
                     .fill(on ? AnyShapeStyle(Theme.redGradient) : AnyShapeStyle(Color.black.opacity(0.05)))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: S(10), style: .continuous)
+                RoundedRectangle(cornerRadius: PZ(10), style: .continuous)
                     .stroke(on ? Theme.todo.opacity(0.55) : Color.clear, lineWidth: 0.9)
             )
         }
@@ -232,7 +251,7 @@ struct RecordPanel: View {
 
     private var optionCard: some View {
         card {
-            VStack(spacing: S(7)) {
+            VStack(spacing: PZ(7)) {
                 optionRow("waveform", "麦克风",
                           rec.audio && !rec.micGranted
                             ? "系统没给麦克风授权 · 这次只录画面"
@@ -245,7 +264,7 @@ struct RecordPanel: View {
                 }
                 divider
                 optionRow("timer", "开始倒计时", "给自己留出摆画面的时间") {
-                    HStack(spacing: S(3)) {
+                    HStack(spacing: PZ(3)) {
                         ForEach([0, 3, 5], id: \.self) { n in
                             miniChip(n == 0 ? "关" : "\(n) 秒", on: rec.countdown == n) { rec.countdown = n }
                         }
@@ -261,24 +280,24 @@ struct RecordPanel: View {
 
     private var startButton: some View {
         Button { rec.start() } label: {
-            HStack(spacing: S(6)) {
+            HStack(spacing: PZ(6)) {
                 Image(systemName: "largecircle.fill.circle")
-                    .font(Fnt.s(14, .semibold))
-                Text("开始录制").font(Fnt.s(13.5, .bold))
+                    .font(PF(14, .semibold))
+                Text("开始录制").font(PF(13.5, .bold))
             }
             .foregroundColor(.white)
             .frame(maxWidth: .infinity)
-            .padding(.vertical, S(11))
-            .background(RoundedRectangle(cornerRadius: S(12), style: .continuous).fill(Theme.redGradient))
-            .overlay(RoundedRectangle(cornerRadius: S(12), style: .continuous)
+            .padding(.vertical, PZ(11))
+            .background(RoundedRectangle(cornerRadius: PZ(12), style: .continuous).fill(Theme.redGradient))
+            .overlay(RoundedRectangle(cornerRadius: PZ(12), style: .continuous)
                 .stroke(Theme.todo.opacity(0.55), lineWidth: 1))
-            .shadow(color: Theme.redDeep.opacity(0.35), radius: S(7), y: S(2))
+            .shadow(color: Theme.redDeep.opacity(0.35), radius: PZ(7), y: PZ(2))
         }
         .buttonStyle(.plain)
     }
 
     private var tailActions: some View {
-        HStack(spacing: S(6)) {
+        HStack(spacing: PZ(6)) {
             ghostButton(rec.checking ? "检查中…" : "检查权限与设备",
                         icon: "checklist") { rec.selfCheck() }
                 .disabled(rec.checking)
@@ -289,31 +308,31 @@ struct RecordPanel: View {
 
     private var recentCard: some View {
         card {
-            VStack(alignment: .leading, spacing: S(6)) {
+            VStack(alignment: .leading, spacing: PZ(6)) {
                 sectionLabel("最近录制", right: "\(recents.count) 条")
                 ForEach(Array(recents.enumerated()), id: \.element.id) { i, c in
                     if i > 0 { divider }
-                    HStack(spacing: S(6)) {
+                    HStack(spacing: PZ(6)) {
                         Image(systemName: "film")
-                            .font(Fnt.s(10, .semibold))
+                            .font(PF(10, .semibold))
                             .foregroundColor(Theme.sched.opacity(0.75))
                         VStack(alignment: .leading, spacing: 0) {
                             Text(c.name)
-                                .font(Fnt.s(9.5, .semibold)).foregroundColor(Theme.ink)
+                                .font(PF(9.5, .semibold)).foregroundColor(Theme.ink)
                                 .lineLimit(1).truncationMode(.middle)
                             Text("\(Media.fmtSize(c.size)) · \(RelativeDate.text(c.date))")
-                                .font(Fnt.s(8.5)).foregroundColor(Theme.inkSoft)
+                                .font(PF(8.5)).foregroundColor(Theme.inkSoft)
                         }
                         Spacer(minLength: 0)
                         Button { rec.open(c.url) } label: {
                             Image(systemName: "play.circle.fill")
-                                .font(Fnt.s(13)).foregroundColor(Theme.sched)
+                                .font(PF(13)).foregroundColor(Theme.sched)
                         }
                         .buttonStyle(.plain)
                         .help("播放")
                         Button { rec.reveal(c.url) } label: {
                             Image(systemName: "magnifyingglass.circle")
-                                .font(Fnt.s(13)).foregroundColor(Theme.inkSoft)
+                                .font(PF(13)).foregroundColor(Theme.inkSoft)
                         }
                         .buttonStyle(.plain)
                         .help("在 Finder 里显示")
@@ -340,76 +359,76 @@ struct RecordPanel: View {
     // MARK: 倒计时 / 录制中 / 收尾
 
     private func countdownStage(_ n: Int) -> some View {
-        VStack(spacing: S(12)) {
+        VStack(spacing: PZ(12)) {
             ZStack {
-                Circle().fill(Theme.sched.opacity(0.10)).frame(width: S(96), height: S(96))
+                Circle().fill(Theme.sched.opacity(0.10)).frame(width: PZ(96), height: PZ(96))
                 Circle().stroke(Theme.todo.opacity(0.5), lineWidth: 1.2)
-                    .frame(width: S(96), height: S(96))
+                    .frame(width: PZ(96), height: PZ(96))
                 Text("\(n)")
-                    .font(Fnt.s(46, .bold, .rounded)).monospacedDigit()
+                    .font(PF(46, .bold, .rounded)).monospacedDigit()
                     .foregroundColor(Theme.sched)
             }
             Text("准备开始 · \(rec.range.label) \(rec.targetText)")
-                .font(Fnt.s(10)).foregroundColor(Theme.inkSoft)
+                .font(PF(10)).foregroundColor(Theme.inkSoft)
             ghostButton("取消", icon: "xmark") { rec.cancelCountdown() }
         }
         .frame(maxWidth: .infinity)
-        .padding(.top, S(30))
+        .padding(.top, PZ(30))
     }
 
     private var recordingStage: some View {
-        VStack(spacing: S(10)) {
+        VStack(spacing: PZ(10)) {
             card {
-                VStack(spacing: S(8)) {
-                    HStack(spacing: S(5)) {
+                VStack(spacing: PZ(8)) {
+                    HStack(spacing: PZ(5)) {
                         PulseDot()
-                        Text("正在录制").font(Fnt.s(11, .bold)).foregroundColor(Theme.sched)
+                        Text("正在录制").font(PF(11, .bold)).foregroundColor(Theme.sched)
                         Spacer(minLength: 0)
                         Text(rec.targetText)
-                            .font(Fnt.s(9.5, .semibold, .rounded))
+                            .font(PF(9.5, .semibold, .rounded))
                             .foregroundColor(Theme.goldDeep)
                     }
                     Text(rec.timerText)
-                        .font(Fnt.s(44, .semibold, .rounded)).monospacedDigit()
+                        .font(PF(44, .semibold, .rounded)).monospacedDigit()
                         .foregroundColor(Theme.ink)
                         .frame(maxWidth: .infinity, alignment: .center)
                     Text("screencapture 是停止时才封装写文件，中途文件大小为 0 属正常")
-                        .font(Fnt.s(8.5)).foregroundColor(Theme.inkSoft.opacity(0.85))
+                        .font(PF(8.5)).foregroundColor(Theme.inkSoft.opacity(0.85))
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Button { rec.stop() } label: {
-                HStack(spacing: S(6)) {
-                    Image(systemName: "stop.fill").font(Fnt.s(12, .bold))
-                    Text("停止并保存").font(Fnt.s(13.5, .bold))
+                HStack(spacing: PZ(6)) {
+                    Image(systemName: "stop.fill").font(PF(12, .bold))
+                    Text("停止并保存").font(PF(13.5, .bold))
                 }
                 .foregroundColor(.white)
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, S(11))
-                .background(RoundedRectangle(cornerRadius: S(12), style: .continuous)
+                .padding(.vertical, PZ(11))
+                .background(RoundedRectangle(cornerRadius: PZ(12), style: .continuous)
                     .fill(LinearGradient(colors: [Theme.redDeep, Theme.warn],
                                          startPoint: .top, endPoint: .bottom)))
-                .overlay(RoundedRectangle(cornerRadius: S(12), style: .continuous)
+                .overlay(RoundedRectangle(cornerRadius: PZ(12), style: .continuous)
                     .stroke(Theme.todo.opacity(0.45), lineWidth: 1))
             }
             .buttonStyle(.plain)
             Text("也可以点屏幕上方悬浮条里的「停止」；书办自己和悬浮条都不参与屏幕采集，成片里不会出现")
-                .font(Fnt.s(8.5)).foregroundColor(Theme.inkSoft)
+                .font(PF(8.5)).foregroundColor(Theme.inkSoft)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.top, S(6))
+        .padding(.top, PZ(6))
     }
 
     private var finishingStage: some View {
-        VStack(spacing: S(10)) {
+        VStack(spacing: PZ(10)) {
             ProgressView().progressViewStyle(.circular).controlSize(.large).tint(Theme.sched)
-                .padding(.top, S(24))
+                .padding(.top, PZ(24))
             Text(rec.statusLine.isEmpty ? "正在封装写入文件…" : rec.statusLine)
-                .font(Fnt.s(11, .semibold)).foregroundColor(Theme.ink)
+                .font(PF(11, .semibold)).foregroundColor(Theme.ink)
             Text("刚结束，正在算时长、体检画面和声音")
-                .font(Fnt.s(9)).foregroundColor(Theme.inkSoft)
+                .font(PF(9)).foregroundColor(Theme.inkSoft)
         }
         .frame(maxWidth: .infinity)
     }
@@ -418,38 +437,38 @@ struct RecordPanel: View {
 
     private func resultCard(_ r: RecResult) -> some View {
         card(tint: Theme.ok.opacity(0.08), border: Theme.ok.opacity(0.35)) {
-            VStack(alignment: .leading, spacing: S(6)) {
-                HStack(spacing: S(5)) {
+            VStack(alignment: .leading, spacing: PZ(6)) {
+                HStack(spacing: PZ(5)) {
                     ZStack {
-                        Circle().fill(Theme.ok).frame(width: S(16), height: S(16))
-                        Image(systemName: "checkmark").font(Fnt.s(8.5, .bold)).foregroundColor(.white)
+                        Circle().fill(Theme.ok).frame(width: PZ(16), height: PZ(16))
+                        Image(systemName: "checkmark").font(PF(8.5, .bold)).foregroundColor(.white)
                     }
-                    Text("录制完成").font(Fnt.s(11.5, .bold)).foregroundColor(Theme.ink)
+                    Text("录制完成").font(PF(11.5, .bold)).foregroundColor(Theme.ink)
                     Spacer(minLength: 0)
                     Text(Media.fmtDuration(r.seconds))
-                        .font(Fnt.s(11, .bold, .rounded)).monospacedDigit()
+                        .font(PF(11, .bold, .rounded)).monospacedDigit()
                         .foregroundColor(Theme.goldDeep)
                 }
                 Text(r.path.lastPathComponent)
-                    .font(Fnt.s(10.5, .semibold)).foregroundColor(Theme.ink).lineLimit(1)
+                    .font(PF(10.5, .semibold)).foregroundColor(Theme.ink).lineLimit(1)
                 Text("\(Media.fmtSize(r.bytes))　·　\(r.hasAudio ? "含语音" : "无音频")　·　"
                      + r.path.deletingLastPathComponent().path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                    .font(Fnt.s(8.5)).foregroundColor(Theme.inkSoft).lineLimit(1)
+                    .font(PF(8.5)).foregroundColor(Theme.inkSoft).lineLimit(1)
                 if !r.note.isEmpty {
                     Text(r.note)
-                        .font(Fnt.s(9)).foregroundColor(Theme.warn)
-                        .padding(S(6))
+                        .font(PF(9)).foregroundColor(Theme.warn)
+                        .padding(PZ(6))
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(RoundedRectangle(cornerRadius: S(7), style: .continuous)
+                        .background(RoundedRectangle(cornerRadius: PZ(7), style: .continuous)
                             .fill(Theme.warn.opacity(0.10)))
                 }
-                HStack(spacing: S(5)) {
+                HStack(spacing: PZ(5)) {
                     ghostButton("播放", icon: "play.fill", solid: true) { rec.open(r.path) }
                     ghostButton("Finder", icon: "folder") { rec.reveal(r.path) }
                     if rec.compressing {
-                        HStack(spacing: S(4)) {
+                        HStack(spacing: PZ(4)) {
                             ProgressView().controlSize(.small).tint(Theme.sched)
-                            Text("压缩中…").font(Fnt.s(9.5, .semibold)).foregroundColor(Theme.inkSoft)
+                            Text("压缩中…").font(PF(9.5, .semibold)).foregroundColor(Theme.inkSoft)
                         }
                     } else {
                         ghostButton(r.shared == nil ? "生成分享版" : "分享版已生成",
@@ -458,10 +477,10 @@ struct RecordPanel: View {
                         }
                     }
                 }
-                .padding(.top, S(2))
+                .padding(.top, PZ(2))
                 if let s = r.shared {
                     Text("分享版 \(Media.fmtSize(Media.bytes(of: s))) · 画面压到 1080p，发微信/邮件够用")
-                        .font(Fnt.s(8.5)).foregroundColor(Theme.goldDeep)
+                        .font(PF(8.5)).foregroundColor(Theme.goldDeep)
                 }
             }
         }
@@ -469,15 +488,15 @@ struct RecordPanel: View {
 
     private func failCard(_ msg: String) -> some View {
         card(tint: Theme.sched.opacity(0.07), border: Theme.sched.opacity(0.30)) {
-            VStack(alignment: .leading, spacing: S(6)) {
-                HStack(spacing: S(5)) {
+            VStack(alignment: .leading, spacing: PZ(6)) {
+                HStack(spacing: PZ(5)) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .font(Fnt.s(11)).foregroundColor(Theme.sched)
-                    Text("录制没成").font(Fnt.s(11, .bold)).foregroundColor(Theme.ink)
+                        .font(PF(11)).foregroundColor(Theme.sched)
+                    Text("录制没成").font(PF(11, .bold)).foregroundColor(Theme.ink)
                 }
-                Text(msg).font(Fnt.s(9.5)).foregroundColor(Theme.inkSoft)
+                Text(msg).font(PF(9.5)).foregroundColor(Theme.inkSoft)
                     .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: S(5)) {
+                HStack(spacing: PZ(5)) {
                     ghostButton("去开启权限", icon: "lock.open") {
                         rec.openPrivacy("Privacy_ScreenCapture")
                     }
@@ -490,11 +509,11 @@ struct RecordPanel: View {
 
     private var checkCard: some View {
         card {
-            VStack(alignment: .leading, spacing: S(4)) {
+            VStack(alignment: .leading, spacing: PZ(4)) {
                 sectionLabel("自检结果")
                 ForEach(rec.checkLines, id: \.self) { l in
                     Text(l)
-                        .font(Fnt.s(9.5, l.hasPrefix("✗") ? .semibold : .regular))
+                        .font(PF(9.5, l.hasPrefix("✗") ? .semibold : .regular))
                         .foregroundColor(l.hasPrefix("✗") ? Theme.sched
                                             : (l.hasPrefix("!") ? Theme.goldDeep : Theme.inkSoft))
                 }
@@ -508,21 +527,21 @@ struct RecordPanel: View {
         HStack(spacing: 5) {
             Circle()
                 .fill(rec.isRecording ? Theme.sched : (rec.granted ? Theme.ok : Theme.todo))
-                .frame(width: S(5), height: S(5))
+                .frame(width: PZ(5), height: PZ(5))
             Text(rec.statusLine.isEmpty ? "成片默认存到 ~/Movies/屏幕录制" : rec.statusLine)
-                .font(Fnt.s(9.5)).foregroundColor(Theme.inkSoft).lineLimit(1)
+                .font(PF(9.5)).foregroundColor(Theme.inkSoft).lineLimit(1)
             Spacer(minLength: 0)
-            Button { store.mode = 0 } label: {
-                Text("回日历").font(Fnt.s(8.5, .semibold)).foregroundColor(Theme.sched)
-                    .padding(.horizontal, S(6)).padding(.vertical, S(2))
+            Button { closePane() } label: {
+                Text("关闭").font(PF(8.5, .semibold)).foregroundColor(Theme.sched)
+                    .padding(.horizontal, PZ(6)).padding(.vertical, PZ(2))
                     .background(Capsule().fill(Theme.sched.opacity(0.10)))
             }
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, S(16))
-        .padding(.vertical, S(7))
+        .padding(.horizontal, PZ(16))
+        .padding(.vertical, PZ(7))
         .background(Theme.cream.opacity(0.92))
-        .overlay(alignment: .top) { Theme.ribbon.frame(height: S(1)).opacity(0.45) }
+        .overlay(alignment: .top) { Theme.ribbon.frame(height: PZ(1)).opacity(0.45) }
     }
 
     // MARK: 通用件
@@ -531,20 +550,20 @@ struct RecordPanel: View {
                                     border: Color = Theme.sched.opacity(0.13),
                                     @ViewBuilder _ content: () -> Content) -> some View {
         content()
-            .padding(.horizontal, S(11)).padding(.vertical, S(9))
+            .padding(.horizontal, PZ(11)).padding(.vertical, PZ(9))
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: S(12), style: .continuous).fill(tint))
-            .overlay(RoundedRectangle(cornerRadius: S(12), style: .continuous)
+            .background(RoundedRectangle(cornerRadius: PZ(12), style: .continuous).fill(tint))
+            .overlay(RoundedRectangle(cornerRadius: PZ(12), style: .continuous)
                 .stroke(border, lineWidth: 0.9))
     }
 
     private func sectionLabel(_ t: String, right: String = "") -> some View {
-        HStack(spacing: S(5)) {
-            Rectangle().fill(Theme.todo).frame(width: S(2), height: S(9))
-            Text(t).font(Fnt.s(9.5, .semibold)).foregroundColor(Theme.goldDeep)
+        HStack(spacing: PZ(5)) {
+            Rectangle().fill(Theme.todo).frame(width: PZ(2), height: PZ(9))
+            Text(t).font(PF(9.5, .semibold)).foregroundColor(Theme.goldDeep)
             Spacer(minLength: 0)
             if !right.isEmpty {
-                Text(right).font(Fnt.s(9, .semibold, .rounded)).foregroundColor(Theme.inkSoft)
+                Text(right).font(PF(9, .semibold, .rounded)).foregroundColor(Theme.inkSoft)
             }
         }
     }
@@ -555,14 +574,14 @@ struct RecordPanel: View {
 
     private func optionRow(_ icon: String, _ title: String, _ sub: String,
                            @ViewBuilder trailing: () -> some View) -> some View {
-        HStack(spacing: S(7)) {
+        HStack(spacing: PZ(7)) {
             Image(systemName: icon)
-                .font(Fnt.s(11, .semibold))
+                .font(PF(11, .semibold))
                 .foregroundColor(Theme.sched.opacity(0.8))
-                .frame(width: S(16))
+                .frame(width: PZ(16))
             VStack(alignment: .leading, spacing: 0) {
-                Text(title).font(Fnt.s(10.5, .semibold)).foregroundColor(Theme.ink)
-                Text(sub).font(Fnt.s(8.5)).foregroundColor(Theme.inkSoft).lineLimit(1)
+                Text(title).font(PF(10.5, .semibold)).foregroundColor(Theme.ink)
+                Text(sub).font(PF(8.5)).foregroundColor(Theme.inkSoft).lineLimit(1)
             }
             Spacer(minLength: 0)
             trailing()
@@ -572,9 +591,9 @@ struct RecordPanel: View {
     private func miniChip(_ t: String, on: Bool, select: @escaping () -> Void) -> some View {
         Button { select() } label: {
             Text(t)
-                .font(Fnt.s(9, on ? .bold : .regular))
+                .font(PF(9, on ? .bold : .regular))
                 .foregroundColor(on ? .white : Theme.inkSoft)
-                .padding(.horizontal, S(7)).padding(.vertical, S(2.5))
+                .padding(.horizontal, PZ(7)).padding(.vertical, PZ(2.5))
                 .background(Capsule().fill(on ? AnyShapeStyle(Theme.redGradient)
                                               : AnyShapeStyle(Color.black.opacity(0.06))))
         }
@@ -584,18 +603,18 @@ struct RecordPanel: View {
     private func ghostButton(_ t: String, icon: String, solid: Bool = false,
                              action: @escaping () -> Void) -> some View {
         Button { action() } label: {
-            HStack(spacing: S(3.5)) {
-                Image(systemName: icon).font(Fnt.s(9, .semibold))
-                Text(t).font(Fnt.s(9.5, .semibold))
+            HStack(spacing: PZ(3.5)) {
+                Image(systemName: icon).font(PF(9, .semibold))
+                Text(t).font(PF(9.5, .semibold))
             }
             .foregroundColor(solid ? .white : Theme.sched)
-            .padding(.horizontal, S(8)).padding(.vertical, S(4.5))
+            .padding(.horizontal, PZ(8)).padding(.vertical, PZ(4.5))
             .background(
-                RoundedRectangle(cornerRadius: S(7), style: .continuous)
+                RoundedRectangle(cornerRadius: PZ(7), style: .continuous)
                     .fill(solid ? AnyShapeStyle(Theme.redGradient) : AnyShapeStyle(Theme.sched.opacity(0.08)))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: S(7), style: .continuous)
+                RoundedRectangle(cornerRadius: PZ(7), style: .continuous)
                     .stroke(solid ? Theme.todo.opacity(0.5) : Theme.sched.opacity(0.22), lineWidth: 0.8)
             )
         }
@@ -645,12 +664,12 @@ struct RecSwitch: View {
             ZStack {
                 Capsule()
                     .fill(on ? AnyShapeStyle(Theme.redGradient) : AnyShapeStyle(Color.black.opacity(0.13)))
-                    .frame(width: S(30), height: S(17))
+                    .frame(width: PZ(30), height: PZ(17))
                 Circle()
                     .fill(.white)
-                    .frame(width: S(13), height: S(13))
+                    .frame(width: PZ(13), height: PZ(13))
                     .shadow(color: .black.opacity(0.18), radius: 0.8, y: 0.5)
-                    .offset(x: on ? S(6) : -S(6))
+                    .offset(x: on ? PZ(6) : -PZ(6))
             }
         }
         .buttonStyle(.plain)
@@ -665,12 +684,12 @@ struct PulseDot: View {
         ZStack {
             Circle()
                 .fill(Theme.sched.opacity(0.35))
-                .frame(width: S(7), height: S(7))
+                .frame(width: PZ(7), height: PZ(7))
                 .scaleEffect(on ? 2.2 : 1)
                 .opacity(on ? 0 : 1)
-            Circle().fill(Theme.sched).frame(width: S(7), height: S(7))
+            Circle().fill(Theme.sched).frame(width: PZ(7), height: PZ(7))
         }
-        .frame(width: S(18), height: S(18))
+        .frame(width: PZ(18), height: PZ(18))
         .onAppear {
             withAnimation(.easeOut(duration: 1.0).repeatForever(autoreverses: false)) { on = true }
         }
