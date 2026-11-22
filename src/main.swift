@@ -2674,6 +2674,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.hasShadow = true
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         p.contentView = host
+        // 挂个身份牌：录屏窗要靠它认出「自己那一扇现在在不在屏幕上」，
+        // 决定要不要每两秒去盘一遍成片目录（见 RecordPanel.paneIsOpen）。
+        // 不能拿标题认人 —— 标题是内部识别用的自由字符串，改起来没有约束。
+        p.identifier = NSUserInterfaceItemIdentifier(frameKey)
         frameKeys[ObjectIdentifier(p)] = frameKey
         VisibleArea.shared.limits[ObjectIdentifier(p)] = (min: min, max: max)
         return p
@@ -3087,12 +3091,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
 
+        // 验收钩子：验「最近录制」那一列的活气 —— 文件在别处被删掉，这一行要自己消失。
+        // 光验 RecordPanel.scan 不够（那是纯函数，本来就对）：真会坏的是
+        // ①轮询压根没跑 ②窗口认错了人、只在 onAppear 刷了一次 ③把录制中的 0 字节临时件也列出来。
+        // 所以这里开真窗口、从进程外删文件、再问界面「你现在列着什么」。
+        if ProcessInfo.processInfo.environment["WECAL_RECENTS_TEST"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                self?.runRecentsTest()
+            }
+        }
+
         // 验收钩子：验「入口叫得出窗口、关掉不丢状态、各窗尺寸互不干扰」。
         // 子功能从主面板的一个态改成独立窗口之后，这三件事光读代码看不出来 ——
         // 尤其「关掉再开」如果变成重建，用户刚选中的笔记、滚到的位置会静悄悄丢掉。
         if ProcessInfo.processInfo.environment["WECAL_FEATURE_TEST"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 self?.runFeatureTest()
+            }
+        }
+    }
+
+    /// 「最近录制」的自动刷新验收。成片目录必须用 WECAL_REC_DIR 换到临时目录，
+    /// 不然就是拿用户真的录屏文件夹做试验田。
+    private func runRecentsTest() {
+        var pass = 0, fail = 0
+        func check(_ ok: Bool, _ label: String) {
+            say(ok ? "  ✓ \(label)" : "  ✗ \(label)")
+            if ok { pass += 1 } else { fail += 1 }
+        }
+        func done() {
+            say("== 结果：\(pass) 通过 / \(fail) 失败 ==")
+            exit(fail == 0 ? 0 : 1)
+        }
+        say("== 最近录制自动刷新用例 ==")
+        guard ProcessInfo.processInfo.environment["WECAL_REC_DIR"] != nil else {
+            say("  ✗ 这个用例必须配 WECAL_REC_DIR=<临时目录> 跑：不能拿用户真的录屏目录做试验")
+            say("== 结果：0 通过 / 1 失败 ==")
+            exit(1)
+        }
+        let fm = FileManager.default
+        let dir = recorder.outDir
+        try? fm.removeItem(at: dir)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        // 三条假成片，mtime 拉开，好看排序。内容不重要 —— 列表只认名字、大小、时间
+        let now = Date().timeIntervalSince1970
+        let plan: [(String, Double)] = [("书办录屏_A.mp4", now - 600),
+                                        ("书办录屏_B.mp4", now - 300),
+                                        ("书办录屏_C.mp4", now - 60)]
+        for (n, t) in plan {
+            let u = dir.appendingPathComponent(n)
+            fm.createFile(atPath: u.path, contents: Data(repeating: 3, count: 2048))
+            try? fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: t)], ofItemAtPath: u.path)
+        }
+        openFeature(.record)
+
+        // 第一步：界面拉到的是这三条、且新在前。
+        // 这里不捕 self —— 用例跑完就 exit，捕获 AppDelegate 反而会让编译器以为还要用
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            let names = RecordPanel.debugRecents.map(\.name)
+            check(names.count == 3, "打开录屏窗 → 列表里是盘上那 3 条（实际 \(names.count)：\(names.joined(separator: "、"))）")
+            check(names.first == "书办录屏_C.mp4", "最新那条排最前（\(names.first ?? "—")）")
+            // 第二步：从进程外删掉最新的一条 —— 相当于用户在 Finder 里按了删除
+            try? fm.removeItem(at: dir.appendingPathComponent("书办录屏_C.mp4"))
+            say("    （已在窗口外删掉 书办录屏_C.mp4，等轮询自己发现）")
+            // 轮询节拍 2 秒，等 3.5 秒足够它跑两轮
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) {
+                let after = RecordPanel.debugRecents.map(\.name)
+                check(!after.contains("书办录屏_C.mp4"),
+                      "没点任何东西，被外部删掉的那条自己消失了（现在：\(after.joined(separator: "、"))）")
+                check(after.count == 2, "条数跟着变成 2（实际 \(after.count)）")
+
+                // 第三步：窗口关掉之后轮询该停下来 —— 不然这条 2 秒的定时器会空转到天荒地老
+                // （关掉只是 orderOut，SwiftUI 的 onDisappear 不一定来，不能指望它）。
+                // 停没停，看「关着的时候删文件，界面那份快照会不会偷偷跟着变」
+                self.closeFeature(.record)
+                try? fm.removeItem(at: dir.appendingPathComponent("书办录屏_A.mp4"))
+                say("    （已关掉录屏窗，并在窗口外删掉 书办录屏_A.mp4）")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
+                    guard let self else { return }
+                    let frozen = RecordPanel.debugRecents.map(\.name)
+                    check(frozen.contains("书办录屏_A.mp4"),
+                          "窗口关着时不去盘上空转（快照停在关闭那刻：\(frozen.joined(separator: "、"))）")
+                    // 重新打开 → 下一拍就得把关着期间发生的删除补上
+                    self.openFeature(.record)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                        let back = RecordPanel.debugRecents.map(\.name)
+                        check(!back.contains("书办录屏_A.mp4"),
+                              "重开录屏窗 → 关着期间删掉的那条自己补上（现在：\(back.joined(separator: "、"))）")
+                        try? fm.removeItem(at: dir)
+                        done()
+                    }
+                }
             }
         }
     }
@@ -3178,6 +3267,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let r = Self.translucentRatio(p)
             check(r < 0.02, "\(f.title)窗底色不透桌面（半透明像素 \(String(format: "%.2f", r * 100))%）")
         }
+
+        // 7) 最近录制那一列：删一条、以及在别处把文件删掉之后要自己消失。
+        //    这条链子全是「盘上的状态 → 界面上的行」，光点界面看不出逻辑对不对，
+        //    所以直接验 RecordPanel.scan / shareCompanions 这两个纯函数，
+        //    在临时目录里造素材，不碰用户真的录屏文件夹。
+        let fm = FileManager.default
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("shuban-recents-test", isDirectory: true)
+        try? fm.removeItem(at: tmp)
+        try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+        var names: [String] = []
+        for i in 0..<3 {
+            let u = tmp.appendingPathComponent("书办录屏_00\(i).mp4")
+            fm.createFile(atPath: u.path, contents: Data(repeating: 7, count: 120 * (i + 1)))
+            // 造出「先后」关系：不设 mtime 的话三条同一秒，排序就没得验了
+            try? fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_760_000_000 + Double(i) * 60)],
+                                  ofItemAtPath: u.path)
+            names.append(u.lastPathComponent)
+        }
+        let scanned = RecordPanel.scan(tmp)
+        check(scanned.count == 3, "盘上三条成片都认得出来（实际 \(scanned.count) 条）")
+        check(scanned.first?.name == names[2], "列表按时间倒序，最新那条排最前（\(scanned.first?.name ?? "—")）")
+
+        // 模拟「在 Finder 里把文件删了」：轮询下一次就该看不见它
+        try? fm.removeItem(at: tmp.appendingPathComponent(names[2]))
+        let afterExternal = RecordPanel.scan(tmp)
+        check(afterExternal.count == 2, "别处删掉一条 → 再扫只剩 2 条（实际 \(afterExternal.count)）")
+        check(!afterExternal.contains { $0.name == names[2] },
+              "被删掉的那条不会留在列表里当僵尸行")
+
+        // 分享版是同一条录制的子件：删原片要连它一起收，删分享版则不许碰原片
+        let sharePath = tmp.appendingPathComponent("书办录屏_000_分享版.mp4")
+        fm.createFile(atPath: sharePath.path, contents: Data(repeating: 7, count: 60))
+        let comps = RecordPanel.shareCompanions(of: tmp.appendingPathComponent(names[0]))
+        check(comps.count == 1 && comps.first?.lastPathComponent == "书办录屏_000_分享版.mp4",
+              "删原片时认得出它的分享版一起收走")
+        check(RecordPanel.shareCompanions(of: sharePath).isEmpty, "删分享版不会顺手把原片带走")
+
+        // 删除动作本身：走系统废纸篓（还能捞回来）。验完把扔进废纸篓的那份掏掉，
+        // 不在用户的废纸篓里留垃圾。
+        let victim = tmp.appendingPathComponent(names[1])
+        var trashed: NSURL?
+        var trashOK = false
+        do {
+            try fm.trashItem(at: victim, resultingItemURL: &trashed)
+            trashOK = true
+        } catch {
+            say("    (废纸篓不可用：\(error.localizedDescription))")
+        }
+        check(trashOK && !fm.fileExists(atPath: victim.path),
+              "点删除是「移到废纸篓」（原位置消失、还能捞回来）")
+        if let t = trashed { try? fm.removeItem(at: t as URL) }
+        try? fm.removeItem(at: tmp)
 
         say("== 结果：\(pass) 通过 / \(fail) 失败 ==")
         exit(fail == 0 ? 0 : 1)
