@@ -244,6 +244,8 @@ final class Store: ObservableObject {
     @Published var monthAnchor: Date = cal.startOfDay(for: Date())
     @Published var selectedDay: Date = cal.startOfDay(for: Date())
     @Published var tab: Int = 1          // 0=日程 1=待办（默认落在待办：需求要求待办优先）
+    /// 面板态：0 = 日历/待办，1 = 录屏。录屏不是一个额外窗口，就是同一块面板的另一个态。
+    @Published var mode: Int = 0
     @Published var scope: Int = 0        // 0=只看我的日历 1=含团队共享日历
     /// 「待办」页内的二级筛选：0=进行中 1=已完成
     @Published var todoFilter: Int = 0
@@ -344,6 +346,8 @@ final class Store: ObservableObject {
         if let sc = ProcessInfo.processInfo.environment["WECAL_SCOPE"], let v = Int(sc) {
             scope = v
         }
+        // 验收钩子：WECAL_MODE=1 直接打开录屏面板（离屏拍图用，正常启动不设）
+        if let m = ProcessInfo.processInfo.environment["WECAL_MODE"], let v = Int(m) { mode = v }
         if let ds = ProcessInfo.processInfo.environment["WECAL_DAY"], let dt = Fmt.day.date(from: ds) {
             let day = cal.startOfDay(for: dt)
             selectedDay = day
@@ -1120,6 +1124,7 @@ func S(_ v: CGFloat) -> CGFloat { v * Fnt.scale }
 
 struct ContentView: View {
     @EnvironmentObject var store: Store
+    @EnvironmentObject var rec: Recorder
     @State private var draft = ""
     /// 新建待办的提醒时间；nil = 不提醒（建无截止时间的待办）
     @State private var whenAt: Date? = nil
@@ -1206,7 +1211,13 @@ struct ContentView: View {
         // 收缩成窄条时换成 peekStrip：窗口只有 14pt 宽，正常布局会被压烂，
         // 所以整块内容直接换掉，而不是让它挤成一团
         Group {
-            if store.peeking { peekStrip } else { mainStack }
+            if store.peeking {
+                peekStrip
+            } else if store.mode == 1 {
+                RecordPanel()
+            } else {
+                mainStack
+            }
         }
         // 对齐到顶部：万一内容仍然超出（极端比例），宁可裁底部也不要切掉表头
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -2434,11 +2445,38 @@ struct ContentView: View {
                 .foregroundColor(store.footerIsError(store.statusText) ? Theme.sched : Theme.inkSoft)
                 .lineLimit(1)
             Spacer(minLength: 0)
+            recordChip
         }
         .padding(.horizontal, S(16))
         .padding(.vertical, S(7))
         .background(Theme.cream.opacity(0.92))
         .overlay(alignment: .top) { Theme.ribbon.frame(height: S(1)).opacity(0.45) }
+    }
+
+    /// 底栏右侧的录屏入口。录制中直接变成「计时 + 停止」，
+    /// 这样即使书办被别的窗口挡住，也能从底栏一键收尾（还有屏幕上的悬浮条兜底）。
+    private var recordChip: some View {
+        Button {
+            if rec.isRecording { rec.stop() } else { store.mode = 1 }
+        } label: {
+            HStack(spacing: S(3)) {
+                Circle()
+                    .fill(rec.isRecording ? Color.white : Theme.sched)
+                    .frame(width: S(5), height: S(5))
+                Text(rec.isRecording ? "\(rec.timerText) 停止" : "录屏")
+                    .font(Fnt.s(8.5, .semibold, rec.isRecording ? .rounded : .default))
+                    .monospacedDigit()
+                    .foregroundColor(rec.isRecording ? .white : Theme.sched)
+            }
+            .padding(.horizontal, S(6))
+            .padding(.vertical, S(2))
+            .background(Capsule().fill(rec.isRecording
+                ? AnyShapeStyle(Theme.redGradient)
+                : AnyShapeStyle(Theme.sched.opacity(0.10))))
+            .overlay(Capsule().stroke(Theme.sched.opacity(rec.isRecording ? 0 : 0.25), lineWidth: 0.8))
+        }
+        .buttonStyle(.plain)
+        .help(rec.isRecording ? "点这里结束录制" : "录屏 · 书办子功能")
     }
 
     private var footerText: String {
@@ -2563,6 +2601,8 @@ final class Panel: NSPanel {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var panel: Panel!
     let store = Store()
+    /// 录屏引擎。整个 app 一份，面板、悬浮条、底栏都读它。
+    let recorder = Recorder()
     let width: CGFloat = 384
     let height: CGFloat = 520
     /// 可缩放范围（窗口 frame 尺寸），与 Fnt 的 0.8~2.0 缩放档对齐。
@@ -2686,7 +2726,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.setActivationPolicy(.regular)
         setupMainMenu()
 
-        let host = BleedHostingView(rootView: ContentView().environmentObject(store))
+        let host = BleedHostingView(rootView: ContentView()
+            .environmentObject(store)
+            .environmentObject(recorder))
         host.frame = NSRect(x: 0, y: 0, width: width, height: height)
 
         let p = Panel(contentRect: host.frame,
@@ -2753,6 +2795,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.orderFrontRegardless()
 
         panel = p
+        // 录制期间把书办主面板也标成「不参与屏幕采集」：界面照常看得见，
+        // 但成片里不会出现（sharingType 就是系统为这事留的正门）。
+        recorder.mainWindow = p
+        recorder.onRecordingStateChange = { [weak self] active in
+            self?.panel?.sharingType = active ? .none : .readOnly
+        }
+        // 出成片了把面板叫回前台，别让用户对着桌面找文件
+        recorder.onPresentResult = { [weak self] in
+            guard let self else { return }
+            self.store.mode = 1
+            self.panel?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
         // 拖动方向的基准：不初始化成当前位置的话，第一次 move 会算出一个巨大的位移
         lastFrameOrigin = p.frame.origin
 
@@ -2930,6 +2985,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
 
+        // 验收钩子：WECAL_REC_CHECK=1 无界面跑一遍自检（录 2 秒测试片段 + 体检），
+        // 把结论行打到 stdout 后退出。用来区分「采集通道坏了」和「停止阶梯坏了」。
+        if ProcessInfo.processInfo.environment["WECAL_REC_CHECK"] == "1" {
+            store.mode = 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                guard let self else { return }
+                self.recorder.selfCheck()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 40) { [weak self] in
+                    guard let self else { return }
+                    print("REC_CHECK granted=\(Media.screenGranted) 残留=\(Media.strayCaptures())")
+                    for l in self.recorder.checkLines { print("REC_CHECK \(l)") }
+                    if self.recorder.checkLines.isEmpty { print("REC_CHECK 没有任何结论（自检没跑完）") }
+                    NSApp.terminate(nil)
+                }
+            }
+        }
+
+        // 验收钩子：WECAL_REC_TEST=6 自动开录、录 6 秒、停、把成片体检结果打到 stdout 后退出。
+        // 用来非交互地验证「权限 → 采集 → 阶梯停止 → 封装 → 自检」整条链路，
+        // 以及最关键的一条：书办自己和悬浮条到底有没有从成片里排掉。
+        if let s = ProcessInfo.processInfo.environment["WECAL_REC_TEST"], let secs = Double(s), secs > 0 {
+            store.mode = 1
+            recorder.countdownOverride = 0
+            recorder.revealOverride = false
+            recorder.onPresentResult = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self else { return }
+                print("REC_TEST 权限预检 granted=\(Media.screenGranted) "
+                      + "残留会话=\(Media.strayCaptures().count) ffmpeg=\(Media.ffmpeg ?? "无")")
+                self.recorder.start()
+                // 立刻把面板拉到最前并让它铺在浏览器窗口之上，整段录制里它都在最上层。
+                // 它要是被别的窗口挡着，「成片里没有它」就只能证明被挡了，证不了被排除。
+                // 验收期把面板提到 .floating：只在验收里这么干，正常使用仍留在 .normal
+                // （用户应该能用别的窗口把书办盖住）。提到最高层之后，
+                // 「成片里没有它」才排除了「被别的窗口挡住」这个解释。
+                self.panel.level = .floating
+                // 对抗性对照：WECAL_REC_SHOW=1 时把面板切回可被采集，
+                // 它必须出现在成片里 —— 这样才证明「看不见」是排除生效，而不是测试本身看不见。
+                if ProcessInfo.processInfo.environment["WECAL_REC_SHOW"] == "1" {
+                    self.panel.sharingType = .readOnly
+                }
+                self.panel.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
+                    guard let self else { return }
+                    if !self.recorder.isRecording {
+                        // start() 走的是失败分支，直接把原因打出来
+                        if case .failed(let m) = self.recorder.phase { print("REC_TEST FAIL \(m)") }
+                        else { print("REC_TEST FAIL 没进到录制态：\(self.recorder.phase)") }
+                        NSApp.terminate(nil)
+                        return
+                    }
+                    print("REC_TEST 录制中，面板 frame=\(self.panel.frame) "
+                          + "sharingType=\(String(describing: self.panel.sharingType)) "
+                          + "level=floating 悬浮条=\(self.recorder.hudVisible ? "在" : "无") "
+                          + "对照=\(ProcessInfo.processInfo.environment["WECAL_REC_SHOW"] == "1" ? "面板应可见" : "面板应不可见")")
+                    self.recorder.stop()
+                    // 收尾 + 体检最慢要跑几十秒（signalstats 要抽帧），这里等足再判
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in
+                        guard let self else { return }
+                        switch self.recorder.phase {
+                        case .done(let r):
+                            print("REC_TEST OK path=\(r.path.path)")
+                            print("REC_TEST OK 时长=\(String(format: "%.1f", r.seconds))s "
+                                  + "体积=\(Media.fmtSize(r.bytes)) 视频轨=\(r.hasVideo) "
+                                  + "音频轨=\(r.hasAudio) note=\(r.note.isEmpty ? "无" : r.note)")
+                        case .failed(let m):
+                            print("REC_TEST FAIL \(m)")
+                        default:
+                            print("REC_TEST FAIL 收尾没走完：\(self.recorder.phase)")
+                        }
+                        NSApp.terminate(nil)
+                    }
+                }
+            }
+        }
+
         store.onHide = { [weak self] in
             guard let self = self, let p = self.panel else { return }
             p.miniaturize(nil)
@@ -2982,6 +3114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         saveFrame()
+        recorder.shutdownSync()
         // 重启/退出时把在跑的刷新掐掉，别留孤儿进程写「成功但空」的结果
         store.cancelRefresh()
         if let m = returnMonitor { NSEvent.removeMonitor(m); returnMonitor = nil }
@@ -3277,6 +3410,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func collapse() {
+        // 录制中不收：收成 14pt 窄条后底栏那颗「停止」就点不到了
+        guard !recorder.isRecording else { return }
         guard let p = panel, let edge = peekEdge, !store.peeking else { return }
         var f = p.frame
         let vf = visibleFrame

@@ -31,6 +31,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSHumanReadableCopyright</key><string>Copyright © 2026 zhanggefei &lt;zhanggefei@126.com&gt; · MIT License</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <!-- 录屏开麦克风时，系统拿这条文案问用户；缺了它子进程收声会被静默拒掉 -->
+  <key>NSMicrophoneUsageDescription</key><string>书办录屏时要把你的解说和会议声音一起录进去。</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>WECALProjectDir</key><string>${DIR}</string>
