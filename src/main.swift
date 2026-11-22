@@ -344,6 +344,9 @@ final class Store: ObservableObject {
         }
     }
 
+    /// 这次启动是「重启书办」拉起来的
+    private(set) var justRelaunched = false
+
     /// 点「重启书办」时记下当前页面。重启是新进程，内存里什么都不剩，
     /// 不落一个一次性键，回来就只剩日历页，用户会以为「没重启」。
     func markRelaunch() {
@@ -362,6 +365,7 @@ final class Store: ObservableObject {
         // 重启回来直接落在录屏页 —— 否则回到日历页，用户根本看不出「到底重启成功了没有」。
         if let m = UserDefaults.standard.object(forKey: "shuban.reopenMode") as? Int {
             mode = m
+            justRelaunched = true
             UserDefaults.standard.removeObject(forKey: "shuban.reopenMode")
         }
         // 验收钩子：WECAL_MODE=1 直接打开录屏面板（离屏拍图用，正常启动不设）
@@ -3115,7 +3119,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 上次退出时窗口本来就贴在边上：重启后不会再收到 windowDidMove，
         // 不主动判一次的话「贴边」这个状态一重启就丢了（要等下次拖窗口才恢复）
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            self?.considerSnap()
+            guard let self else { return }
+            // 刚点过「重启书办」：把面板摆到前面让人看见，别 1.2 秒后又贴边收成 14pt 窄条 ——
+            // 那样重启成功了也像是「什么都没发生」。贴边状态等下次拖窗口自然恢复。
+            if self.store.justRelaunched {
+                self.panel?.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                self.store.logUI("重启完成：落在第 \(self.store.mode == 1 ? "录屏" : "日历") 页，面板已展开")
+                return
+            }
+            self.considerSnap()
         }
     }
 
