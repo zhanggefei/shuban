@@ -646,10 +646,11 @@ final class Store: ObservableObject {
                 out = "写入失败：" + error.localizedDescription
             }
             let text = out.trimmingCharacters(in: .whitespacesAndNewlines)
+            let code = rc   // 并发闭包不能捕获可变变量（Swift 6 是硬错误）
             await MainActor.run { [weak self] in
                 guard let self = self else { return }
                 self.syncingIds.remove(draft.todoId)
-                if rc == 0 {
+                if code == 0 {
                     // 脚本已把真实条目写进 data.json：先读回来，再撤掉临时那条，
                     // 顺序反了会闪一下「消失又出现」
                     self.load(force: true)
@@ -915,20 +916,21 @@ final class Store: ObservableObject {
                 out = "启动失败：\(error.localizedDescription)"
             }
             let rc = p.terminationStatus
+            let result = out   // 并发闭包不能捕获可变变量（Swift 6 是硬错误）
             await MainActor.run { [weak self] in
                 guard let self = self else { return }
                 self.refreshProc = nil
                 self.refreshing = false
                 self.load(force: true)
                 // 权限类错误由底部状态栏按 errors 精确提示，这里只兜底其他异常
-                if rc == 0 || out.contains("850003") {
+                if rc == 0 || result.contains("850003") {
                     // 自动同步成功不该抹掉用户刚看到的提示（比如「已延到 09:00」），
                     // 只把自己之前那条失败提示收掉
                     if !silent || self.statusText.hasPrefix("自动同步") { self.statusText = "" }
                 } else {
                     // 优先取脚本里打了 "!!" 的那行，别把「== 刷新书办数据 ==」
                     // 这种标题当成错误提示（之前点刷新失败只看到这行标题，等于没说原因）
-                    let lines = out.split(separator: "\n")
+                    let lines = result.split(separator: "\n")
                         .map { $0.trimmingCharacters(in: .whitespaces) }
                         .filter { !$0.isEmpty }
                     let msg = lines.first(where: { $0.hasPrefix("!!") })
@@ -1148,7 +1150,7 @@ struct ContentView: View {
     }
 
     /// 收缩态窄条：14pt 的红金书脊。左右贴边=竖条，上下贴边=横条。
-    /// 只放「历」+ 待办数（有过期再加一个金点），够他扫一眼知道里面有没有事。
+    /// 只放「书」字 + 待办数（有过期再加一个金点），够扫一眼知道里面有没有事。
     private var peekStrip: some View {
         ZStack {
             Theme.redGradient
@@ -1157,7 +1159,7 @@ struct ContentView: View {
                 .padding(1.5)
             if store.peekVertical {
                 VStack(spacing: 3) {
-                    Text("历")
+                    Text("书")
                         .font(.system(size: 8, weight: .heavy))
                         .foregroundColor(.white)
                     Rectangle().fill(Theme.todo.opacity(0.75)).frame(width: 6, height: 1)
@@ -1172,7 +1174,7 @@ struct ContentView: View {
                 .padding(.vertical, 8)
             } else {
                 HStack(spacing: 4) {
-                    Text("历").font(.system(size: 8, weight: .heavy)).foregroundColor(.white)
+                    Text("书").font(.system(size: 8, weight: .heavy)).foregroundColor(.white)
                     Text("待办 \(store.openTodos.count)")
                         .font(.system(size: 7.5, weight: .semibold))
                         .foregroundColor(.white.opacity(0.92))
@@ -1300,7 +1302,7 @@ struct ContentView: View {
             RoundedRectangle(cornerRadius: S(8), style: .continuous)
                 .strokeBorder(Theme.todo.opacity(0.75), lineWidth: 0.9)
                 .frame(width: S(26), height: S(26))
-            Text("历")
+            Text("书")
                 .font(Fnt.s(15, .bold, .serif))
                 .foregroundColor(.white)
                 .offset(y: S(-0.5))
@@ -2535,11 +2537,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let store = Store()
     let width: CGFloat = 384
     let height: CGFloat = 520
-    /// 可缩放范围（窗口 frame 尺寸），与 Fnt 的 0.8~2.0 缩放档对齐
-    static let minW: CGFloat = 320
-    static let maxW: CGFloat = 768
-    static let minH: CGFloat = 430
-    static let maxH: CGFloat = 1040
+    /// 可缩放范围（窗口 frame 尺寸），与 Fnt 的 0.8~2.0 缩放档对齐。
+    /// NSWindowDelegate 的回调在非隔离上下文里，这几个常量也被它引用，
+    /// 所以显式 nonisolated（Swift 6 严格并发下不加就是编译错误）
+    nonisolated static let minW: CGFloat = 320
+    nonisolated static let maxW: CGFloat = 768
+    nonisolated static let minH: CGFloat = 430
+    nonisolated static let maxH: CGFloat = 1040
 
     // MARK: 窗口尺寸持久化（只存展开态）
 
@@ -2600,21 +2604,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 收起前的完整尺寸，展开时按它恢复
     private var expandedFrame: NSRect = .zero
     private var peekTimer: Timer?
-    /// 鼠标离开窗口的起始时刻（要连续离开 0.8 秒才收，避免扫一下就缩）
+    /// 鼠标离开界面的起始时刻（连续离开超过 peekHold 才收，避免压过一条线就闪）
     private var outsideSince: Date?
     /// 我们自己 setFrame 期间屏蔽「贴边判定」，否则展开动画的中间帧会被判成「离开边缘」
     private var suppressSnapUntil = Date.distantPast
+    // 下面几个几何常量被 nonisolated 的纯函数（peekExpandZone / incidental）用到，
+    // 而整个类是 @MainActor —— 不加 nonisolated 在 Swift 6 严格并发下是编译错误。
+    // 它们都是编译期常量，nonisolated 是安全的，也让贴边几何能脱离主线程单测。
     /// 窄条厚度
-    static let peekThickness: CGFloat = 14
+    nonisolated static let peekThickness: CGFloat = 14
     /// 离边多近算想贴上去 / 离边多远算不贴了
-    static let snapGap: CGFloat = 18
-    static let releaseGap: CGFloat = 50
+    nonisolated static let snapGap: CGFloat = 18
+    nonisolated static let releaseGap: CGFloat = 50
     /// 窄条唤出命中区的外扩量：只要「压到那条线」就算要看，但不能宽到路过就弹
     /// （16pt 时被否掉了：鼠标沿屏幕边走路都会把界面撑开）
-    static let peekHotSlack: CGFloat = 6
+    nonisolated static let peekHotSlack: CGFloat = 6
     /// 指针离开界面后到收起的等待。只留一个轮询周期多一点（0.12s/次）做防抖，
     /// 语义上就是「一出界面马上缩回去」
-    static let peekHold: TimeInterval = 0.15
+    nonisolated static let peekHold: TimeInterval = 0.15
     private var peekTestMode = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {

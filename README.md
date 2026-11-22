@@ -8,6 +8,8 @@
 
 <sub>macOS 13+ · Swift + SwiftUI · MIT License</sub>
 
+<sub>名字取自「书办」——旧时官署里文案办理的那份差事。贴在屏幕边时它就像一根书脊，摊开是一桌待办。</sub>
+
 </div>
 
 ![主界面](docs/screenshots/main.png)
@@ -36,7 +38,7 @@
 </tr>
 <tr>
 <td align="center"><sub>到点提醒：可直接推迟或完成</sub></td>
-<td align="center"><sub>贴边后的窄条（放大）</sub></td>
+<td align="center"><sub>贴右边后的窄条：左边是原比例，右边放大 3 倍</sub></td>
 </tr>
 </table>
 
