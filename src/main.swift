@@ -2748,6 +2748,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.setActivationPolicy(.regular)
         setupMainMenu()
 
+        // 回调要在建窗口之前接好：SwiftUI 的 onAppear 可能在面板第一次上屏的那一刻就触发
+        // （录屏页一出现就会登记授权），接晚了那几条日志会丢。
+        recorder.onLog = { [weak self] line in self?.store.logUI(line) }
+        recorder.onRelaunch = { [weak self] in self?.store.markRelaunch() }
+
         let host = BleedHostingView(rootView: ContentView()
             .environmentObject(store)
             .environmentObject(recorder))
@@ -2831,8 +2836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             NSApp.activate(ignoringOtherApps: true)
         }
         // 「重启」这类动作必须留痕：事后只看界面是分不清「没点到」「点了没生效」的
-        recorder.onLog = { [weak self] line in self?.store.logUI(line) }
-        recorder.onRelaunch = { [weak self] in self?.store.markRelaunch() }
+        // （回调已在 applicationDidFinishLaunching 开头接好，这里不再重复赋值）
         // 拖动方向的基准：不初始化成当前位置的话，第一次 move 会算出一个巨大的位移
         lastFrameOrigin = p.frame.origin
 
@@ -3138,7 +3142,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func pollCheck(until deadline: Date) {
         if !recorder.checking && !recorder.checkLines.isEmpty {
             print("REC_CHECK granted=\(Media.screenGranted) 残留=\(Media.strayCaptures())")
-            for l in recorder.checkLines { print("REC_CHECK \(l)") }
+            store.logUI("REC_CHECK granted=\(Media.screenGranted) 残留=\(Media.strayCaptures().count)")
+            for l in recorder.checkLines {
+                print("REC_CHECK \(l)")
+                store.logUI("REC_CHECK \(l)")   // 从 LaunchServices 拉起时 stdout 拿不到，只能看日志
+            }
             NSApp.terminate(nil)
             return
         }

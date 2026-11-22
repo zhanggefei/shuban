@@ -300,6 +300,8 @@ final class Recorder: ObservableObject {
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var elapsed: Double = 0
     @Published private(set) var granted = Media.screenGranted
+    /// 麦克风授权状态（发布出去，界面据此提示「这次只录画面」）
+    @Published private(set) var micOK = Media.micGranted
     /// 已框选的区域（屏幕采集坐标系：原点在主屏左上角、y 向下）
     @Published private(set) var region: CGRect?
     @Published var compressing = false
@@ -335,6 +337,7 @@ final class Recorder: ObservableObject {
     private var outputPath: URL?
     private var startedAt: Date?
     private var timer: Timer?
+    private var permTimer: Timer?
     private var countdownTimer: Timer?
     private var countLeft = 0
     private var hangDetected = false
@@ -344,6 +347,8 @@ final class Recorder: ObservableObject {
     private var waitingMic = false
     /// 已经在走重启流程：连点两下不能起两个 helper
     private var relaunching = false
+    /// 进录屏页的授权登记只做一次（每次启动）
+    private var registeredOnce = false
     private var hud: RecHUD?
     private let d = UserDefaults.standard
 
@@ -356,7 +361,7 @@ final class Recorder: ObservableObject {
     }
     var hasSecondScreen: Bool { NSScreen.screens.count >= 2 }
     /// 麦克风到底有没有系统授权（界面据此提示「这次只录画面」）
-    var micGranted: Bool { Media.micGranted }
+    var micGranted: Bool { micOK }
 
     var timerText: String { Media.fmtDuration(elapsed) }
 
@@ -390,13 +395,33 @@ final class Recorder: ObservableObject {
         clicks = (d.object(forKey: "shuban.rec.clicks") as? Bool) ?? true
         countdown = (d.object(forKey: "shuban.rec.countdown") as? Int) ?? 3
         reveal = (d.object(forKey: "shuban.rec.reveal") as? Bool) ?? true
+        startPermissionWatch()
     }
 
     private func save(_ key: String, _ v: Any) { d.set(v, forKey: key) }
 
     // MARK: 权限
 
-    func refreshPermission() { granted = Media.screenGranted }
+    func refreshPermission() {
+        let g = Media.screenGranted
+        let m = Media.micGranted
+        if g != granted || m != micOK {
+            onLog?("权限变化：屏幕录制 \(granted ? "有" : "无") → \(g ? "有" : "无")，"
+                   + "麦克风 \(micOK ? "有" : "无") → \(m ? "有" : "无")")
+            granted = g
+            micOK = m
+        }
+    }
+
+    /// 每 2 秒自查一次权限。
+    /// 用户去系统设置勾上之后，界面必须自己变 —— 让他回来还得点一次「重启书办」才更新，
+    /// 他看到的仍然是「还差权限」，只会得出「勾了也没用」的结论（2026-11-22 就是这么误会的）。
+    private func startPermissionWatch() {
+        permTimer?.invalidate()
+        permTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshPermission() }
+        }
+    }
 
     func requestPermission() {
         Media.requestScreen()
@@ -411,6 +436,20 @@ final class Recorder: ObservableObject {
         if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
             NSWorkspace.shared.open(u)
         }
+    }
+
+    /// 进录屏页时登记一次：没权限就调一次 CGRequestScreenCaptureAccess，
+    /// 让系统把「书办」写进「屏幕录制」列表。不登记的话用户点「去开启」进去，
+    /// 列表里根本没有书办这一项，只能得出「找不到、给不了权限」。
+    func ensureRegisteredOnce() {
+        guard !registeredOnce else { return }
+        registeredOnce = true
+        if !Media.screenGranted {
+            Media.requestScreen()
+            onLog?("已在系统里登记屏幕录制授权申请（等用户去勾）")
+            refreshPermission()
+        }
+        if !Media.micGranted && Media.micUndetermined { Media.requestMic() }
     }
 
     /// 授权改了必须重启才生效，给用户一个一键重启。

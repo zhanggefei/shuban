@@ -47,7 +47,18 @@ if [ -f "$DIR/data/data.json" ]; then
   cp "$DIR/data/data.json" "$APP/Contents/Resources/data.json"
 fi
 
-codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+# 签名：优先用本机自签身份，退路才是 ad-hoc。
+#
+# ⚠️ 为什么不能每次都 ad-hoc：ad-hoc 的 designated requirement 就是「cdhash 相等」，
+# 每改一行代码重新编译 cdhash 都变 → 系统认为换了个应用 → 屏幕录制 / 麦克风授权全部失效，
+# 而系统设置里那条「书办」还勾着，于是出现「勾着、说没权限、重启也没用」的死结。
+# 用自签证书签，DR 变成「identifier + 证书指纹」，重新编译不会动它，授权一次长期有效。
+SIGN_ID="ShuBan Local Signing"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "$SIGN_ID"; then
+  codesign --force --sign "$SIGN_ID" "$APP" >/dev/null 2>&1 || codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+else
+  codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+fi
 
 echo "== 完成 =="
 echo "$APP"

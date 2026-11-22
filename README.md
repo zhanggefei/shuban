@@ -116,6 +116,18 @@ data/data.json        本地数据快照（不入库）
 11. **「重启书办」不能在本进程里 sleep 完再拉开自己。** `NSApp.terminate` 是同步的，`applicationWillTerminate` 一返回进程就 exit，后台队列里等 1 秒的那个 block 会被一起带走 —— 只有退出流程恰好超过 1 秒那次才重启得起来，表现是「有时能重启、有时点了一点反应都没有」。正确做法是起一个 `/bin/sh` 子进程，用 `kill -0` 轮询本 pid 消失后再 `open -n`：子进程被 launchd 收养，不受父进程退出影响。重启回来还要落在录屏页（`shuban.reopenMode` 一次性键），否则回到日历页看不出重启成功。
 12. **`screencapture` 的 `-V` / `-D` 数值必须紧贴。** `-V 2` 会被解析成「`-V` 没有值 + `2` 当输出文件名」，既不限时、又把片子写到名为 `2` 的地方，进程永不退出：自检永远卡在「正在录…」、强杀后一个文件都没有。实测 `-V 2` 8 秒无文件，`-V2` 2 秒正常出片。`-R` 分开写可用，保持原样。
 13. **麦克风没授权就绝对不能带 `-g` 起采集。** 授权弹窗挂着时 `screencapture -g` 会一直不退出，正式录制的表现就是「停止后文件不存在、stderr 为空」。现在开录前先问一次授权，未决定就等用户点掉弹窗（最多 25 秒），拒绝或超时则自动降级成「只录画面」并在界面上直说。
+14. **签名必须用固定身份，不能每次 ad-hoc。** ad-hoc 签名的 designated requirement 就是「cdhash 相等」，改一行代码重新编译就等于换了个应用，屏幕录制 / 麦克风授权立刻作废 —— 而系统设置里那条「书办」还勾着，于是出现「明明勾着、说没权限、重启也没用」的死结。现在 `build.sh` 优先用本机自签证书 `ShuBan Local Signing`（DR 变成 `identifier + 证书指纹`，重编译不动它），没有该证书才退回 ad-hoc。自己造一张：
+    ```sh
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 3650 \
+      -subj "/CN=ShuBan Local Signing" -addext "extendedKeyUsage=critical,codeSigning" \
+      -addext "basicConstraints=critical,CA:true"
+    openssl pkcs12 -export -inkey key.pem -in cert.pem -out id.p12 -passout pass:shuban \
+      -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1
+    security import id.p12 -k ~/Library/Keychains/login.keychain-db -P shuban -T /usr/bin/codesign
+    security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db cert.pem
+    ```
+    （`-certpbe/-keypbe/-macalg` 不能省，OpenSSL 3 默认参数 macOS 的 `security import` 读不了，会报 MAC verification failed。）历史遗留的僵尸授权记录用 `tccutil reset ScreenCapture com.zhanggefei.shuban` 清掉再授权。
+15. **验权限别用 shell 直跑 bundle 里的可执行文件。** `./build/书办.app/Contents/MacOS/ShuBan` 这样直接 exec 时，TCC 会把权限算在**父进程**（终端 / 宿主应用）头上，`CGPreflightScreenCaptureAccess()` 读到的是终端的授权，于是「有权限」是假象。要用 `open -n --env WECAL_REC_CHECK=1 build/书办.app` 让 LaunchServices 拉起，结论会写进 `data/ui.log`（stdout 拿不到）。
 
 ## 调试与离屏验收开关
 
