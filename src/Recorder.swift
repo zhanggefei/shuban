@@ -94,6 +94,32 @@ nonisolated enum Media {
     @discardableResult
     static func requestScreen() -> Bool { CGRequestScreenCaptureAccess() }
 
+    // MARK: 麦克风权限（不授权就绝不能带 -g 起采集）
+
+    /// 麦克风已授权
+    static var micGranted: Bool { AVCaptureDevice.authorizationStatus(for: .audio) == .authorized }
+    /// 还没问过：系统弹窗可能正挂着
+    static var micUndetermined: Bool { AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined }
+    /// 一次都没申请过（本进程内）就申请一次
+    static func requestMic() { AVCaptureDevice.requestAccess(for: .audio) { _ in } }
+
+    /// 等用户把授权弹窗点掉，返回最终是否可用。
+    ///
+    /// ⚠️ 为什么必须等：`screencapture -g` 在麦克风没授权、弹窗还挂着的时候**不会退出**，
+    /// 进程就一直卡在那儿 —— 自检卡在「正在录…」，正式录制则是「停止后文件不存在、stderr 为空」。
+    /// 之前那条「偶发录完没文件」的记录，根因大概率就是这个（重建签名后麦克风授权被重置）。
+    static func awaitMic(seconds: Double) -> Bool {
+        if micGranted { return true }
+        if micUndetermined { requestMic() }
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if micGranted { return true }
+            if !micUndetermined { return false }   // 用户已经拒绝，不用再等
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        return micGranted
+    }
+
     /// 仍在跑的录制会话。并发录制会互相抢采集通道，表现就是黑屏。
     static func strayCaptures() -> [String] {
         let (rc, out) = run("/bin/pgrep", ["-f", "screencapture -v"], timeout: 8)
@@ -126,9 +152,14 @@ nonisolated enum Media {
             a += ["-R", "\(Int(r.minX.rounded())),\(Int(r.minY.rounded())),"
                     + "\(Int(r.width.rounded())),\(Int(r.height.rounded()))"]
         } else if let d = display {
-            a += ["-D", "\(d)"]
+            a.append("-D\(d)")
         }
-        if let l = limit { a += ["-V", "\(l)"] }
+        // ⚠️ -V 的数值必须紧贴：`-V 2` 会被解析成「-V 没有值 + 2 当输出文件名」，
+        // 于是既不限时、又把片子写到名为 "2" 的地方，进程永不退出 ——
+        // 表现就是自检永远卡在「正在录…」、强杀后一个文件都没有。
+        // 2026-11-22 实测：`-V 2` 8 秒仍无文件，`-V2` 2 秒就正常出片（81690 字节）。
+        // （-R 分开写实测可用，保持原样；-D 同样按 usage 里的 `-D<display>` 贴合写法。）
+        if let l = limit { a.append("-V\(l)") }
         a.append(out)
         return a
     }
@@ -287,6 +318,10 @@ final class Recorder: ObservableObject {
     var onRecordingStateChange: ((Bool) -> Void)?
     /// 出成片了 → 把面板拉到前面，免得用户找不到结果
     var onPresentResult: (() -> Void)?
+    /// 点「重启书办」前留个记号（重启回来还落在录屏页，不然看不出重启成功了）
+    var onRelaunch: (() -> Void)?
+    /// 关键动作写到 data/ui.log：「点了重启」这种事必须留痕，否则事后无从判断点击有没有送达
+    var onLog: ((String) -> Void)?
 
     let outDir: URL = {
         let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
@@ -303,6 +338,12 @@ final class Recorder: ObservableObject {
     private var countdownTimer: Timer?
     private var countLeft = 0
     private var hangDetected = false
+    /// 本次实际是否收声：设置里开了、但系统没授权时自动降级成只录画面
+    private var audioThisRun = false
+    /// 正在等麦克风授权弹窗被点掉（此时不算录制中，但也不许重复点开始）
+    private var waitingMic = false
+    /// 已经在走重启流程：连点两下不能起两个 helper
+    private var relaunching = false
     private var hud: RecHUD?
     private let d = UserDefaults.standard
 
@@ -314,6 +355,8 @@ final class Recorder: ObservableObject {
         }
     }
     var hasSecondScreen: Bool { NSScreen.screens.count >= 2 }
+    /// 麦克风到底有没有系统授权（界面据此提示「这次只录画面」）
+    var micGranted: Bool { Media.micGranted }
 
     var timerText: String { Media.fmtDuration(elapsed) }
 
@@ -370,13 +413,41 @@ final class Recorder: ObservableObject {
         }
     }
 
-    /// 授权改了必须重启才生效，给用户一个一键重启
+    /// 授权改了必须重启才生效，给用户一个一键重启。
+    ///
+    /// ⚠️ 这个函数踩过一个很阴的坑（2026-11-22，菲哥报「点击重启，并没有重启」）：
+    /// 原来写的是「后台队列 sleep 1 秒 → NSWorkspace.open，然后立刻 NSApp.terminate」。
+    /// terminate 是同步的，applicationWillTerminate 一返回进程就 exit()，
+    /// 后台队列里那个还躺在 Thread.sleep 里的 block 会被一起带走 ——
+    /// 只有退出流程本身恰好超过 1 秒（正在录屏要等 shutdownSync、或刷新子进程要收尾）
+    /// 那次 open 才跑得到。表现就是「有时能重启、有时点了一点反应都没有」，随机复现。
+    /// 正确做法：把「等本进程死掉再拉起」交给一个独立的小 shell。
+    /// 子进程在父进程退出后被 launchd 收养，不受 exit() 影响。
     func relaunch() {
+        guard !relaunching else { return }
+        relaunching = true
+        statusLine = "正在重启…"
+        onRelaunch?()
+
         let url = Bundle.main.bundleURL
-        DispatchQueue.global().async {
-            Thread.sleep(forTimeInterval: 1.0)
-            NSWorkspace.shared.open(url)
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        // $0=sh $1=bundle 路径。kill -0 只探活不发信号；进程一消失立刻拉起。
+        // 上限 100 次 × 0.1s：万一退出被卡住，宁可这次没起来，也别让 helper 永久挂着。
+        helper.arguments = ["-c",
+            "i=0; while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.1; "
+            + "i=$((i+1)); [ $i -gt 100 ] && break; done; "
+            + "/usr/bin/open -n \"$1\"", "sh", url.path]
+        do {
+            try helper.run()
+        } catch {
+            relaunching = false
+            statusLine = "重启失败：\(error.localizedDescription)"
+            onLog?("重启失败：\(error.localizedDescription)")
+            return
         }
+        onLog?("点了「重启书办」：子进程 \(helper.processIdentifier) 等 pid \(pid) 退出后拉起")
         NSApp.terminate(nil)
     }
 
@@ -399,7 +470,7 @@ final class Recorder: ObservableObject {
     // MARK: 开始
 
     func start() {
-        guard !isBusy else { return }
+        guard !isBusy, !waitingMic else { return }
         hangDetected = false
 
         guard Media.screenGranted else {
@@ -426,8 +497,37 @@ final class Recorder: ObservableObject {
             return
         }
 
-        if audio { requestMicOnce() }
+        audioThisRun = audio
+        if audio && !Media.micGranted {
+            requestMicOnce()
+            if Media.micUndetermined {
+                // 弹窗正挂着：这时候起采集必卡死（screencapture -g 会一直不退出）。
+                // 等用户点完再走，期间既不算录制中，也不允许重复点开始。
+                waitingMic = true
+                statusLine = "等你在系统弹窗里点一下「允许」…"
+                DispatchQueue.global().async { [weak self] in
+                    let ok = Media.awaitMic(seconds: 25)
+                    DispatchQueue.main.async {
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            self.waitingMic = false
+                            guard case .idle = self.phase else { return }  // 期间被取消/已开始
+                            self.audioThisRun = ok
+                            if !ok { self.statusLine = "麦克风没授权，这次只录画面" }
+                            self.beginNow()
+                        }
+                    }
+                }
+                return
+            }
+            audioThisRun = false
+            statusLine = "麦克风没授权，这次只录画面"
+        }
+        beginNow()
+    }
 
+    /// 权限都问清楚了，按设置走倒计时或直接开录
+    private func beginNow() {
         let cd = countdownOverride ?? countdown
         if cd > 0 {
             startCountdown(cd)
@@ -496,7 +596,7 @@ final class Recorder: ObservableObject {
         p.executableURL = URL(fileURLWithPath: Media.screencapture)
         p.arguments = Media.captureArgs(rect: rect,
                                         display: range == .second ? 2 : nil,
-                                        audio: audio, clicks: clicks,
+                                        audio: audioThisRun, clicks: clicks,
                                         limit: nil, out: url.path)
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = FileHandle.nullDevice
@@ -780,7 +880,10 @@ final class Recorder: ObservableObject {
         checking = true
         checkLines = []
         statusLine = "正在录 2 秒测试片段验证权限…"
-        let wantAudio = audio
+        // 没授权就绝不带 -g：麦克风弹窗挂着时 screencapture 不会退出，自检会永远停在「正在录…」
+        if audio && !Media.micGranted && Media.micUndetermined { Media.requestMic() }
+        let wantAudioSetting = audio
+        let wantAudio = audio && Media.micGranted
         DispatchQueue.global().async { [weak self] in
             var lines: [String] = []
             let tmp = FileManager.default.temporaryDirectory
@@ -794,7 +897,20 @@ final class Recorder: ObservableObject {
             p.standardOutput = FileHandle.nullDevice
             p.standardError = FileHandle.nullDevice
             try? p.run()
-            p.waitUntilExit()
+            // 看门狗：`-V 2` 正常 2 秒就退，卡住说明采集通道或授权有问题。
+            // 不能直接 waitUntilExit —— 那会把 checking 永久钉在 true，界面看着像死机。
+            var waited = 0.0
+            while p.isRunning && waited < 20 {
+                Thread.sleep(forTimeInterval: 0.2)
+                waited += 0.2
+            }
+            var hung = false
+            if p.isRunning {
+                hung = true
+                p.terminate()
+                Thread.sleep(forTimeInterval: 0.6)
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            }
             let size = Media.bytes(of: tmp)
             let (dur, hv, ha) = size > 4096 ? Media.probe(tmp.path) : (nil, false, false)
             let luma = hv ? Media.luma(tmp.path) : nil
@@ -805,11 +921,18 @@ final class Recorder: ObservableObject {
                     ? "✗ 屏幕录制：画面全黑（亮度 \(String(format: "%.0f", luma!))），权限没生效"
                     : "✓ 屏幕录制：正常" + (luma.map { "（亮度 \(String(format: "%.0f", $0))）" } ?? ""))
                 : "✗ 屏幕录制：没录到画面，权限没生效")
+            if hung {
+                lines.append("✗ 采集 20 秒没退出，已强杀：采集通道被占住了，注销重登能彻底恢复")
+            }
             if wantAudio {
                 if !ha { lines.append("✗ 麦克风：没有音频轨，缺权限或设备被占用") }
                 else if let v = vol, v.1 == nil { lines.append("! 麦克风：有音轨但全程静音") }
                 else if let v = vol, let mx = v.1 { lines.append("✓ 麦克风：正常（峰值 \(String(format: "%.1f", mx)) dB）") }
                 else { lines.append("✓ 麦克风：已录到音轨") }
+            } else if wantAudioSetting {
+                lines.append(Media.micUndetermined
+                    ? "! 麦克风：授权弹窗还没点，这次只验了画面"
+                    : "✗ 麦克风：没授权（系统设置 → 隐私与安全性 → 麦克风）；不勾也能只录画面")
             } else {
                 lines.append("– 麦克风：按设置不录声音")
             }

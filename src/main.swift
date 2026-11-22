@@ -9,6 +9,12 @@
 import SwiftUI
 import AppKit
 
+/// 验收钩子专用的输出。print 在重定向到文件时是块缓冲的，进程还活着就一行都看不到 ——
+/// 「重启」这类要跨进程观察的用例如果用它，读到的永远是空文件，很容易误判成「没执行」。
+func say(_ s: String) {
+    FileHandle.standardOutput.write(Data((s + "\n").utf8))
+}
+
 // MARK: - 数据模型
 
 struct ScheduleItem: Codable, Identifiable {
@@ -338,6 +344,12 @@ final class Store: ObservableObject {
         }
     }
 
+    /// 点「重启书办」时记下当前页面。重启是新进程，内存里什么都不剩，
+    /// 不落一个一次性键，回来就只剩日历页，用户会以为「没重启」。
+    func markRelaunch() {
+        UserDefaults.standard.set(mode, forKey: "shuban.reopenMode")
+    }
+
     init() {
         resolvePaths()
         if let t = ProcessInfo.processInfo.environment["WECAL_TAB"], let v = Int(t), v == 0 || v == 1 {
@@ -345,6 +357,12 @@ final class Store: ObservableObject {
         }
         if let sc = ProcessInfo.processInfo.environment["WECAL_SCOPE"], let v = Int(sc) {
             scope = v
+        }
+        // 点「重启书办」前记下的页面：一次性键，读完就删，正常退出不会把页面钉死在录屏上。
+        // 重启回来直接落在录屏页 —— 否则回到日历页，用户根本看不出「到底重启成功了没有」。
+        if let m = UserDefaults.standard.object(forKey: "shuban.reopenMode") as? Int {
+            mode = m
+            UserDefaults.standard.removeObject(forKey: "shuban.reopenMode")
         }
         // 验收钩子：WECAL_MODE=1 直接打开录屏面板（离屏拍图用，正常启动不设）
         if let m = ProcessInfo.processInfo.environment["WECAL_MODE"], let v = Int(m) { mode = v }
@@ -2808,6 +2826,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.panel?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
         }
+        // 「重启」这类动作必须留痕：事后只看界面是分不清「没点到」「点了没生效」的
+        recorder.onLog = { [weak self] line in self?.store.logUI(line) }
+        recorder.onRelaunch = { [weak self] in self?.store.markRelaunch() }
         // 拖动方向的基准：不初始化成当前位置的话，第一次 move 会算出一个巨大的位移
         lastFrameOrigin = p.frame.origin
 
@@ -2989,16 +3010,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 把结论行打到 stdout 后退出。用来区分「采集通道坏了」和「停止阶梯坏了」。
         if ProcessInfo.processInfo.environment["WECAL_REC_CHECK"] == "1" {
             store.mode = 1
+            // 自检纯粹是后台探测，没必要在桌面上闪一个面板（菲哥正在干活）
+            panel?.orderOut(nil)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                 guard let self else { return }
                 self.recorder.selfCheck()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 40) { [weak self] in
-                    guard let self else { return }
-                    print("REC_CHECK granted=\(Media.screenGranted) 残留=\(Media.strayCaptures())")
-                    for l in self.recorder.checkLines { print("REC_CHECK \(l)") }
-                    if self.recorder.checkLines.isEmpty { print("REC_CHECK 没有任何结论（自检没跑完）") }
-                    NSApp.terminate(nil)
-                }
+                self.pollCheck(until: Date().addingTimeInterval(50))
             }
         }
 
@@ -3062,6 +3079,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
 
+        // 验收钩子：WECAL_RELAUNCH_TEST=1 —— 真点一次「重启书办」，验「旧进程退出 + 新进程被拉起」。
+        // 这个 bug 是随机的（退得快就起不来），所以必须跑多轮，不能只看一次成功就当修好了。
+        // 防循环：拉起的新实例若也带着这个环境变量，会在拿到标记文件后退回正常启动
+        //（open 通常不传环境变量，但这条兜底不能省，一旦成环就是无限重启）。
+        if ProcessInfo.processInfo.environment["WECAL_RELAUNCH_TEST"] == "1" {
+            // 标记文件必须落在固定的 /tmp：NSTemporaryDirectory() 是进程私有目录，
+            // 从 shell 根本找不到（第一版就写在这里，结果清理不到 → 后两轮全被判成「第 2 个实例」）
+            let mark = "/tmp/shuban_relaunch_test.mark"
+            if FileManager.default.fileExists(atPath: mark) {
+                say("RELAUNCH_TEST 第 2 个实例（标记文件在）：退回正常启动 pid=\(ProcessInfo.processInfo.processIdentifier)")
+            } else {
+                FileManager.default.createFile(atPath: mark, contents: Data())
+                store.mode = 1
+                say("RELAUNCH_TEST 旧 pid=\(ProcessInfo.processInfo.processIdentifier) 2.5 秒后点重启")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                    say("RELAUNCH_TEST 触发 relaunch()")
+                    self?.recorder.relaunch()
+                }
+            }
+        }
+
         store.onHide = { [weak self] in
             guard let self = self, let p = self.panel else { return }
             p.miniaturize(nil)
@@ -3078,6 +3116,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 不主动判一次的话「贴边」这个状态一重启就丢了（要等下次拖窗口才恢复）
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
             self?.considerSnap()
+        }
+    }
+
+    // MARK: 自检轮询
+
+    /// 结论一出来就走，别按固定 40 秒死等 —— 自检常态 5 秒左右就完了。
+    private func pollCheck(until deadline: Date) {
+        if !recorder.checking && !recorder.checkLines.isEmpty {
+            print("REC_CHECK granted=\(Media.screenGranted) 残留=\(Media.strayCaptures())")
+            for l in recorder.checkLines { print("REC_CHECK \(l)") }
+            NSApp.terminate(nil)
+            return
+        }
+        if Date() > deadline {
+            print("REC_CHECK granted=\(Media.screenGranted) 残留=\(Media.strayCaptures())")
+            print("REC_CHECK 超时：checking=\(recorder.checking) 结论数=\(recorder.checkLines.count) "
+                  + "状态=\(recorder.statusLine)")
+            NSApp.terminate(nil)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.pollCheck(until: deadline)
         }
     }
 
