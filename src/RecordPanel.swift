@@ -33,6 +33,9 @@ struct RecordPanel: View {
         }
         .onAppear {
             rec.refreshPermission()
+            // 没权限就顺手向系统登记一次：不然系统设置里根本找不到「书办」这一项，
+            // 用户点「去开启」进去也只能对着空列表发呆。
+            rec.ensureRegisteredOnce()
             loadRecents()
         }
         .onChange(of: rec.phase) { _ in loadRecents() }
@@ -149,8 +152,8 @@ struct RecordPanel: View {
                 }
                 Text(" macOS 的规定：勾上之后必须重启书办才生效。授权一次，以后不用再管。")
                     .font(Fnt.s(9.5)).foregroundColor(Theme.inkSoft).fixedSize(horizontal: false, vertical: true)
-                Text("勾了还是这个提示？去系统设置把「书办」用 − 移除、再 ＋ 加回来。"
-                     + "每次重新编译签名都会变，系统就认不出还是同一个应用了。")
+                Text("在「系统设置 → 隐私与安全性 → 屏幕录制」里勾上「书办」，再点「重启书办」。"
+                     + "列表里没有它就先点「去开启」。勾上了这里会在两秒内自动消失。")
                     .font(Fnt.s(9)).foregroundColor(Theme.inkSoft.opacity(0.85))
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: S(6)) {
