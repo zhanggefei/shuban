@@ -201,11 +201,7 @@ struct RecordPanel: View {
                 .fixedSize(horizontal: false, vertical: true)
                 // 剩下的高度全给最近录制：窗口高一点就多看几条，
                 // 而不是底下空一大块 —— 桌面软件的主列表本来就该跟着窗口长
-                if recents.isEmpty {
-                    Spacer(minLength: 0)
-                } else {
-                    recentCard
-                }
+                recentCard
             }
             .frame(minHeight: max(0, geo.size.height - PZ(25)), alignment: .top)
             .padding(.horizontal, PZ(14))
@@ -339,6 +335,17 @@ struct RecordPanel: View {
         card(stretch: true) {
             VStack(alignment: .leading, spacing: PZ(6)) {
                 sectionLabel("最近录制", right: "\(recents.count) 条")
+                if recents.isEmpty {
+                    // 空列表也留这张卡：删掉最后一条之后整块塌掉，看着像出了 bug，
+                    // 而不是「这里本来就没东西」
+                    HStack(spacing: PZ(5)) {
+                        Image(systemName: "tray")
+                            .font(PF(10)).foregroundColor(Theme.inkSoft.opacity(0.55))
+                        Text("还没有成片 · 录一段就有了")
+                            .font(PF(9.5)).foregroundColor(Theme.inkSoft.opacity(0.85))
+                    }
+                    .padding(.top, PZ(2))
+                }
                 ForEach(Array(recents.enumerated()), id: \.element.id) { i, c in
                     if i > 0 { divider }
                     HStack(spacing: PZ(6)) {
