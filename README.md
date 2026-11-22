@@ -4,7 +4,7 @@
 
 **常驻 macOS 桌面的办公小助手。贴到屏幕边就收成一条书脊，鼠标移过去立刻展开。**
 
-当前接通企业微信的日程与待办，并且自带一个录屏（主屏 / 选区 / 副屏，带麦克风与点击高亮）；会持续往上叠能力，目标是把每天要看的、要办的事收在一个小窗口里。
+当前接通企业微信的日程与待办，并且自带一个录屏（主屏 / 选区 / 副屏，带麦克风与点击高亮）和一个记事本（自定义树形目录、可贴图）；会持续往上叠能力，目标是把每天要看的、要办的事收在一个小窗口里。
 
 <sub>macOS 13+ · Swift + SwiftUI · MIT License</sub>
 
@@ -32,6 +32,8 @@
 | 单实例 + 自启 | 重复启动会静默退出（避免提醒弹两遍）；可选登录自启 |
 | **录屏** | 底栏「录屏」进同一个面板：主屏 / 框选 / 副屏三档，可收麦克风、可开点击高亮、可倒计时；录完自动体检并给「播放 / Finder / 生成分享版」 |
 | 录屏不入镜 | 书办自己的面板和录制中的悬浮条都标了 `sharingType = .none`，成片里不会出现（截图对照验证过） |
+| **记事本** | 底栏「笔记」进同一个面板：左边的树自己搭（文件夹 / 笔记可任意嵌套，拖动改层级，右键改名、上下移、移到顶层），右边写正文，`⌘V` 直接贴图，点缩略图放大 |
+| 笔记全本地 | 存在 `data/notes/`：一份 `notes.json` + `images/`，纯明文、原子写入，拷走就是备份 |
 
 <table>
 <tr>
@@ -49,6 +51,14 @@
 <img src="docs/screenshots/rec.png" width="52%" alt="录屏面板" />
 
 <sub>录屏不是一个额外窗口，就是从底栏那颗红点进来的同一个面板</sub>
+
+</div>
+
+<div align="center">
+
+<img src="docs/screenshots/notes.png" width="52%" alt="记事本面板" />
+
+<sub>记事本：左边自己搭目录树，右边写正文，⌘V 直接贴图</sub>
 
 </div>
 
@@ -96,7 +106,10 @@ src/main.swift        主面板、日历、待办、贴边收起、自动同步
 src/Reminder.swift    桌面提醒窗口
 src/Recorder.swift    录屏引擎（screencapture 子进程、阶梯停止、成片体检、分享版压缩）
 src/RecordPanel.swift 录屏面板（书办视觉，和日程/待办并列的另一个面板态）
+src/NoteStore.swift   记事本数据层（扁平节点表 + parent 指针、防抖落盘、图片归集）
+src/NotePanel.swift   记事本面板（目录树 + 编辑器 + 贴图）
 data/data.json        本地数据快照（不入库）
+data/notes/           记事本数据：notes.json + images/（不入库）
 ```
 
 ## 几个绕不开的设计取舍
@@ -128,6 +141,9 @@ data/data.json        本地数据快照（不入库）
     ```
     （`-certpbe/-keypbe/-macalg` 不能省，OpenSSL 3 默认参数 macOS 的 `security import` 读不了，会报 MAC verification failed。）历史遗留的僵尸授权记录用 `tccutil reset ScreenCapture com.zhanggefei.shuban` 清掉再授权。
 15. **验权限别用 shell 直跑 bundle 里的可执行文件。** `./build/书办.app/Contents/MacOS/ShuBan` 这样直接 exec 时，TCC 会把权限算在**父进程**（终端 / 宿主应用）头上，`CGPreflightScreenCaptureAccess()` 读到的是终端的授权，于是「有权限」是假象。要用 `open -n --env WECAL_REC_CHECK=1 build/书办.app` 让 LaunchServices 拉起，结论会写进 `data/ui.log`（stdout 拿不到）。
+16. **底栏那个回车监视器必须按页面豁免。** 为了治「输入法还没上屏就按回车」，装了一个本地按键监视器接管 Return。它认的是「首响应者是 NSTextView 就吞掉」，而记事本正文的 `TextEditor` 底下正好也是一个 NSTextView —— 不豁免的话正文永远打不出第二段。现在 `store.mode == 2` 直接放行，并且有 `WECAL_NOTES_ENTER_TEST=1` 真投一个回车来验（去掉那行 guard，用例会立刻变红；这是验过对照的）。
+17. **笔记树存成扁平表 + `parent` 指针，不存嵌套结构。** 改名、移动、删除都只改一行字段，不用递归拷贝子树；JSON 结构也永远是稳定的两层，层级再深也不会出现递归解码的坑。取树时按 `parent` 现算（几十上百个节点毫无压力）。展开状态跟着 `notes.json` 一起存，谁把哪个文件夹打开了，下次进来还开着。
+
 
 ## 调试与离屏验收开关
 
@@ -151,6 +167,11 @@ data/data.json        本地数据快照（不入库）
 | `WECAL_REC_SHOW=1` | 对照用：录制期间把面板切回可被采集，它**应该**出现在成片里 |
 | `WECAL_REC_DEBUG=1` | 打印采集参数、输出目录可写性、停止阶梯的每步结果 |
 | `WECAL_RELAUNCH_TEST=1` | 启动 2.5 秒后真点一次「重启书办」，验旧进程退出 + 新进程被拉起（用 `/tmp/shuban_relaunch_test.mark` 防循环） |
+| `WECAL_MODE=2` | 启动即打开记事本 |
+| `WECAL_NOTES_TEST=1` | 记事本数据层用例表（30 条，临时目录里跑，不建窗口） |
+| `WECAL_NOTES_ENTER_TEST=1` | 在正文里真按一次回车，验它变成换行而不是被底栏那个回车监视器吃掉 |
+| `WECAL_NOTES_DIR=/tmp/x` | 把笔记目录指到别处（拍图、试拖动时用，不碰真实笔记） |
+| `WECAL_NOTES_PICK=关键词` | 启动即按标题选中某条笔记（拍图不用手点） |
 
 ## 路线图
 
