@@ -233,7 +233,9 @@ struct NotePanel: View {
                 .padding(.vertical, PZ(4))
             }
         }
-        .background(Theme.cream.opacity(0.55))
+        // 侧栏要比正文暗一档才看得出两栏的分界。以前这层是 cream 0.55、
+        // 靠窗口透明透出桌面壁纸才显出层次；窗口铺了实底之后那个做法就只剩一片白
+        .background(Color.black.opacity(0.045))
     }
 
     private var searchRow: some View {
