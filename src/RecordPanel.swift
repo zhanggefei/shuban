@@ -149,6 +149,10 @@ struct RecordPanel: View {
                 }
                 Text(" macOS 的规定：勾上之后必须重启书办才生效。授权一次，以后不用再管。")
                     .font(Fnt.s(9.5)).foregroundColor(Theme.inkSoft).fixedSize(horizontal: false, vertical: true)
+                Text("勾了还是这个提示？去系统设置把「书办」用 − 移除、再 ＋ 加回来。"
+                     + "每次重新编译签名都会变，系统就认不出还是同一个应用了。")
+                    .font(Fnt.s(9)).foregroundColor(Theme.inkSoft.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: S(6)) {
                     ghostButton("去开启", icon: "arrow.up.forward.square") {
                         rec.openPrivacy("Privacy_ScreenCapture")
@@ -226,7 +230,10 @@ struct RecordPanel: View {
     private var optionCard: some View {
         card {
             VStack(spacing: S(7)) {
-                optionRow("waveform", "麦克风", "解说、会议声音一起录进去") {
+                optionRow("waveform", "麦克风",
+                          rec.audio && !rec.micGranted
+                            ? "系统没给麦克风授权 · 这次只录画面"
+                            : "解说、会议声音一起录进去") {
                     RecSwitch(on: rec.audio) { rec.audio = $0 }
                 }
                 divider
