@@ -2473,6 +2473,14 @@ struct VisualEffectBackground: NSViewRepresentable {
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
+/// 可见区尺寸的中转站。windowWillResize 必须在非隔离上下文里同步返回夹紧后的尺寸，
+/// 却读不到 MainActor 隔离的 NSWindow.screen —— 由主线程写、它读。
+/// AppKit 的窗口回调本来就都在主线程，所以 @unchecked 是安全的。
+final class VisibleArea: @unchecked Sendable {
+    static let shared = VisibleArea()
+    var frame = NSRect(x: 0, y: 0, width: 1440, height: 900)
+}
+
 // MARK: - 贴边判定的用例表（WECAL_PEEK_TEST=4 跑）
 // 真机鼠标位置脚本伪造不了，所以把几何判定抽成纯函数后，用假坐标把规则钉死。
 // 注意：这只能证明「判定算得对」，不能证明「事件真的会送到判定里」——后者仍需真机点一下。
@@ -2509,17 +2517,37 @@ enum PeekCase {
         check("横条下方 4pt（留的边）", expT.contains(NSPoint(x: 1160, y: 882)), true)
         check("横条下方 12pt（超出留边，不弹）", expT.contains(NSPoint(x: 1160, y: 874)), false)
         check("顶边沿", expT.contains(NSPoint(x: 1160, y: 899)), true)
-        // —— 「顺便撞边」不该被当成停靠意愿 ——
-        let vf = NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let tall = NSRect(x: 1038, y: 31, width: 402, height: 869)   // 用户当时的实际尺寸
-        check("869 高的窗口顶住上边 = 顺便，不贴顶",
-              AppDelegate.incidental(.top, tall, vf), true)
-        check("同一条窗口贴右边 = 真意愿，允许贴右",
-              AppDelegate.incidental(.right, tall, vf), false)
-        check("常规 320×520 贴顶算意愿",
-              AppDelegate.incidental(.top, NSRect(x: 1000, y: 347, width: 320, height: 520), vf), false)
-        check("超宽窗口贴左边 = 顺便",
-              AppDelegate.incidental(.left, NSRect(x: 0, y: 100, width: 1100, height: 520), vf), true)
+        // —— 贴边判定：窗口拉满一屏高时，几何上上下间隙都是 0，只能靠拖动方向定 ---
+        let vf = NSRect(x: 0, y: 0, width: 1440, height: 875)   // 1440×900 屏减掉菜单栏
+        func gapsOf(_ f: NSRect) -> [(AppDelegate.PeekEdge, CGFloat)] {
+            [(.top, vf.maxY - f.maxY), (.bottom, f.minY - vf.minY),
+             (.left, f.minX - vf.minX), (.right, vf.maxX - f.maxX)]
+        }
+        func decide(_ name: String, _ f: NSRect, bias: AppDelegate.PeekEdge?, drag: CGFloat,
+                    _ want: AppDelegate.SnapDecision) {
+            let got = AppDelegate.decideSnap(gapsOf(f), bias: bias, drag: drag)
+            print("\(got == want ? "PASS" : "FAIL") \(name)（期望 \(want)，实得 \(got)）")
+            if got != want { fails += 1 }
+        }
+        let full = NSRect(x: 336, y: 0, width: 768, height: 875)   // 和可见区一样高
+        decide("拉满一屏 + 往上拖 → 贴顶", full, bias: .top, drag: 40, .snap(.top))
+        decide("拉满一屏 + 往下拖 → 贴底", full, bias: .bottom, drag: 40, .snap(.bottom))
+        decide("拉满一屏 + 没有拖动方向（启动恢复）→ 按优先级贴顶", full, bias: nil, drag: 0, .snap(.top))
+        decide("贴顶但这次是横着拖（bias 没贴着）→ 仍贴几何上贴到的边",
+               full, bias: .right, drag: 40, .snap(.top))
+        decide("只贴左边、拖着方向是往上 → 不能被 bias 掰成贴顶",
+               NSRect(x: 0, y: 200, width: 320, height: 520), bias: .top, drag: 30, .snap(.left))
+        // 顶边留 30pt（在 18pt 吸附区外）、底边留 145pt、左右各 336pt → 应该什么都不做
+        decide("离顶 30pt（在吸附区外）→ 先不动",
+               NSRect(x: 336, y: 145, width: 768, height: 700), bias: .top, drag: 40, .hold)
+        decide("四边都超过 50pt → 解除贴边态",
+               NSRect(x: 336, y: 120, width: 768, height: 600), bias: .top, drag: 40, .release)
+        // —— 唤出尺寸不能比屏幕还高（现存那份 768×900 就是） ——
+        let fitted = AppDelegate.fitToScreen(NSRect(x: 336, y: 0, width: 768, height: 900), vf)
+        check("768×900 在 875 高的可见区里 → 高被夹到 875", abs(fitted.height - 875) < 0.5, true)
+        check("夹完不超屏", fitted.maxY <= vf.maxY + 0.5, true)
+        let keep = AppDelegate.fitToScreen(NSRect(x: 100, y: 100, width: 384, height: 560), vf)
+        check("常规 384×560 原样保留", keep == NSRect(x: 100, y: 100, width: 384, height: 560), true)
         print("PEEK_TEST=4 用例 \(fails == 0 ? "全部通过" : "有 \(fails) 条不通过")")
     }
 }
@@ -2544,6 +2572,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     nonisolated static let maxW: CGFloat = 768
     nonisolated static let minH: CGFloat = 430
     nonisolated static let maxH: CGFloat = 1040
+
+    /// 尺寸上限要再被屏幕可见区夹一道。之前只夹 maxW/maxH（768/1040），
+    /// 于是在 1440×900 这种屏上能把窗口拉得比可见区还高（现存那份 768×900 就比
+    /// 可见区高了约 25pt，顶部压在菜单栏底下），贴边唤出看着就像「自动铺满全屏」。
+    nonisolated static func fitToScreen(_ f: NSRect, _ vf: NSRect) -> NSRect {
+        var g = f
+        // 上限 = maxW 与「屏幕可见区」里较小的那个，但不能低于下限本身
+        let upperW = max(minW, min(maxW, vf.width))
+        let upperH = max(minH, min(maxH, vf.height))
+        g.size.width = min(max(f.width, minW), upperW)
+        g.size.height = min(max(f.height, minH), upperH)
+        g.origin.x = min(max(g.origin.x, vf.minX), max(vf.minX, vf.maxX - g.width))
+        g.origin.y = min(max(g.origin.y, vf.minY), max(vf.minY, vf.maxY - g.height))
+        return g
+    }
 
     // MARK: 窗口尺寸持久化（只存展开态）
 
@@ -2575,10 +2618,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for s in saved.compactMap({ $0 }) {
             var f = NSRectFromString(s)
             guard f.width >= Self.minW - 1, f.height >= Self.minH - 1 else { continue }
-            f.size.width = min(max(f.width, Self.minW), Self.maxW)
-            f.size.height = min(max(f.height, Self.minH), Self.maxH)
-            f.origin.x = min(max(f.origin.x, vf.minX), max(vf.minX, vf.maxX - f.width))
-            f.origin.y = min(max(f.origin.y, vf.minY), max(vf.minY, vf.maxY - f.height))
+            // 恢复时也走一遍屏幕夹紧：老存档可能是「比可见区还高」的尺寸
+            f = Self.fitToScreen(f, vf)
             p.setFrame(f, display: false)
             return
         }
@@ -2587,7 +2628,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     // MARK: 贴边收缩（edge peek）
-    enum PeekEdge {
+    enum PeekEdge: Equatable {
         case left, right, top, bottom
         var vertical: Bool { self == .left || self == .right }
         var name: String {
@@ -2608,7 +2649,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var outsideSince: Date?
     /// 我们自己 setFrame 期间屏蔽「贴边判定」，否则展开动画的中间帧会被判成「离开边缘」
     private var suppressSnapUntil = Date.distantPast
-    // 下面几个几何常量被 nonisolated 的纯函数（peekExpandZone / incidental）用到，
+    /// 缩放结束后的这段时间里，跟来的 windowDidMove 一律当缩放的副产品忽略
+    private var resizeSettleUntil = Date.distantPast
+    nonisolated static let resizeSettle: TimeInterval = 0.5
+    /// 上一次 move 到的位置，用来算拖动方向（决定拉满一屏时贴哪条边）
+    private var lastFrameOrigin: NSPoint = .zero
+    private var dragBias: PeekEdge?
+    private var dragDistance: CGFloat = 0
+    // 下面几个几何常量被 nonisolated 的纯函数（peekExpandZone / decideSnap）用到，
     // 而整个类是 @MainActor —— 不加 nonisolated 在 Swift 6 严格并发下是编译错误。
     // 它们都是编译期常量，nonisolated 是安全的，也让贴边几何能脱离主线程单测。
     /// 窄条厚度
@@ -2623,6 +2671,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 语义上就是「一出界面马上缩回去」
     nonisolated static let peekHold: TimeInterval = 0.15
     private var peekTestMode = false
+    /// 只冻结 hover 自动收/展（拍图时用），不影响贴边判定。
+    /// 之前共用 peekTestMode 一个开关，把 considerSnap 也一起挡了 ——
+    /// 结果链路测试里「往上拖到顶」永远判成不贴边（2026-11-22 由 WECAL_PEEK_TEST=5 抓到）
+    private var hoverFrozen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 验收钩子 4：只跑贴边判定的用例表，不建窗口、跑完即退
@@ -2701,6 +2753,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.orderFrontRegardless()
 
         panel = p
+        // 拖动方向的基准：不初始化成当前位置的话，第一次 move 会算出一个巨大的位移
+        lastFrameOrigin = p.frame.origin
+
+        // 验收钩子 5：把「拖动 vs 缩放」这两条事件链路跑成真证据。
+        // 用例表（=4）只能证明纯函数算得对，证明不了事件送得到 —— 这里直接喂 delegate 回调。
+        if ProcessInfo.processInfo.environment["WECAL_PEEK_TEST"] == "5" {
+            hoverFrozen = true      // 注意：这里不能设 peekTestMode，那会连贴边判定一起挡掉
+            runPeekEventChain(p)
+        }
 
         // 验收钩子：WECAL_PEEK_TEST=1 启动后贴右边并收起（拍竖窄条）；=2 收起后再展开（验恢复尺寸）；
         // =3 贴顶收起（拍横窄条，走的是另一套 HStack 布局，最容易溢出）。
@@ -2928,14 +2989,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 拖拽缩放时的尺寸闸门：contentMinSize 在 fullSizeContentView 下不生效，改为手动夹紧
     nonisolated func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
-        NSSize(width: min(max(frameSize.width, AppDelegate.minW), AppDelegate.maxW),
-               height: min(max(frameSize.height, AppDelegate.minH), AppDelegate.maxH))
+        // 这里不能直接读 sender.screen —— NSWindow.screen 是 MainActor 的，
+        // 而本回调在非隔离上下文（AppKit 实际就在主线程调它）。读主线程写好的中转值。
+        let vf = VisibleArea.shared.frame
+        let upperW = max(AppDelegate.minW, min(AppDelegate.maxW, vf.width))
+        let upperH = max(AppDelegate.minH, min(AppDelegate.maxH, vf.height))
+        return NSSize(width: min(max(frameSize.width, AppDelegate.minW), upperW),
+                      height: min(max(frameSize.height, AppDelegate.minH), upperH))
     }
 
     /// 拖拽缩放时同步全局缩放档（字号与固定尺寸随之重排）
     nonisolated func windowDidResize(_ notification: Notification) {
         Task { @MainActor [weak self] in
             guard let self, let f = self.panel?.contentView?.frame else { return }
+            // 从下边往上拖高会同时改 origin.y，AppKit 会跟着补发 windowDidMove ——
+            // 那一下不是「他往边上拖」，得压掉，否则「把窗口拉高顶住上边」会被当成贴顶。
+            // 用时间窗而不是标志位：两者在同一次拖拽里交替到达，顺序不可靠。
+            self.resizeSettleUntil = Date().addingTimeInterval(Self.resizeSettle)
             self.store.applyZoom(f.width, f.height)
             self.scheduleSaveFrame()
         }
@@ -2944,16 +3014,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 窗口被拖动 → 判断要不要贴边
     nonisolated func windowDidMove(_ notification: Notification) {
         Task { @MainActor [weak self] in
-            self?.scheduleSaveFrame()
-            self?.considerSnap()
+            guard let self, let p = self.panel else { return }
+            self.scheduleSaveFrame()
+            if ProcessInfo.processInfo.environment["WECAL_PEEK_TEST"] == "5" {
+                print("LINK5   ↳ didMove 到达 y=\(Int(p.frame.minY)) resize抑制中=\(Date() < self.resizeSettleUntil) 贴边抑制中=\(Date() < self.suppressSnapUntil)")
+            }
+            if Date() < self.resizeSettleUntil { return }   // 缩放带出来的 move，不算停靠
+            // 记下这次拖动的方向。窗口拉满一屏高时上下间隙都是 0，「贴哪条边」
+            // 光看几何分不出来，只能看他往哪个方向拖。
+            let cur = p.frame
+            let dx = cur.minX - self.lastFrameOrigin.x
+            let dy = cur.minY - self.lastFrameOrigin.y
+            self.lastFrameOrigin = cur.origin
+            self.dragDistance = max(abs(dx), abs(dy))
+            if abs(dx) >= abs(dy) {
+                self.dragBias = abs(dx) < 2 ? nil : (dx > 0 ? .right : .left)   // Cocoa x 向右增大
+            } else {
+                self.dragBias = abs(dy) < 2 ? nil : (dy > 0 ? .top : .bottom)   // y 向上增大
+            }
+            self.considerSnap()
         }
     }
 
     // MARK: 贴边收缩实现
 
     private var visibleFrame: NSRect {
-        (panel?.screen ?? NSScreen.main)?.visibleFrame
+        let r = (panel?.screen ?? NSScreen.main)?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        VisibleArea.shared.frame = r   // 给非隔离的 windowWillResize 用
+        return r
     }
 
     /// 0.12 秒一次轮询鼠标位置。用 NSEvent.mouseLocation 而不是全局事件监听：
@@ -2962,6 +3051,113 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         peekTimer?.invalidate()
         peekTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.peekTick() }
+        }
+    }
+
+    /// 喂假事件跑贴边链路，逐步打日志（WECAL_PEEK_TEST=5）。
+    /// 坐标全部按当前屏幕可见区算，不写死数字。
+    private func runPeekEventChain(_ p: NSWindow) {
+        let vf = visibleFrame
+        var fails = 0
+        func say(_ s: String) { print("LINK5 \(s)") }
+        func expect(_ name: String, _ want: PeekEdge?, at t: TimeInterval) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + t) {
+                let got = self.peekEdge
+                if got != want {
+                    let vf = self.visibleFrame
+                    let f = p.frame
+                    say("诊断 @\(String(format: "%.1f", t)) frame=\(Int(f.minX)),\(Int(f.minY)),\(Int(f.width))×\(Int(f.height))"
+                        + " 间隙 顶\(Int(vf.maxY - f.maxY)) 底\(Int(f.minY - vf.minY)) 左\(Int(f.minX - vf.minX)) 右\(Int(vf.maxX - f.maxX))"
+                        + " peekEnabled=\(self.store.peekEnabled) peeking=\(self.store.peeking)"
+                        + " 抑制中=\(Date() < self.suppressSnapUntil) resize抑制中=\(Date() < self.resizeSettleUntil)"
+                        + " 方向=\(self.dragBias.map { $0.name } ?? "nil") 位移=\(Int(self.dragDistance))")
+                }
+                let ok = got == want
+                let w = want.map { $0.name } ?? "nil"
+                let g = got.map { $0.name } ?? "nil"
+                print("\(ok ? "PASS" : "FAIL") 链路 \(name)（期望 \(w)，实得 \(g)）")
+                if !ok { fails += 1 }
+            }
+        }
+        func place(_ r: NSRect) {
+            self.suppressSnapUntil = Date().addingTimeInterval(0.05)
+            p.setFrame(r, display: true)
+        }
+        func fakeMove() {
+            self.suppressSnapUntil = .distantPast
+            self.windowDidMove(Notification(name: NSWindow.didMoveNotification, object: p))
+        }
+        let w: CGFloat = 560, h: CGFloat = 700
+        let mid = NSRect(x: vf.midX - w / 2, y: vf.minY + 60, width: w, height: h)
+        let touchTop = NSRect(x: vf.midX - w / 2, y: vf.maxY - h, width: w, height: h)
+        let belowTop = NSRect(x: vf.midX - w / 2, y: vf.maxY - h - 20, width: w, height: h)
+        say("开始：可见区 \(Int(vf.width))×\(Int(vf.height))，测试窗口 \(Int(w))×\(Int(h))")
+
+        // ① 摆在中间，四条边都没碰 → 不该有任何贴边
+        peekEdge = nil
+        place(mid)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { fakeMove() }
+        expect("摆在中间拖着 → 不贴边", nil, at: 1.1)
+
+        // ② 往上拖到顶 → 该判成贴顶（这就是菲哥要的「顶部贴边能收进去」）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            self.peekEdge = nil
+            place(belowTop)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                place(touchTop)
+                fakeMove()
+            }
+        }
+        expect("往上拖到顶 → 贴顶", .top, at: 2.6)
+
+        // ③ 把窗口顶边往上拖大（拉高）→ AppKit 会补发 move，这一下不该算停靠
+        //    就是 13:01 那次「拉高窗口被收成一条横线弹到屏幕顶」的回归
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            self.peekEdge = nil
+            place(NSRect(x: vf.midX - w / 2, y: vf.maxY - h - 60, width: w, height: h))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                // 拖窗口上边把高度从 700 拉到 760，同时 origin.y 上移 → resize + move 成对出现
+                let grown = NSRect(x: vf.midX - w / 2, y: vf.maxY - 760, width: w, height: 760)
+                self.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: p))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    self.suppressSnapUntil = Date().addingTimeInterval(0.05)
+                    p.setFrame(grown, display: true)
+                    self.windowDidMove(Notification(name: NSWindow.didMoveNotification, object: p))
+                }
+            }
+        }
+        expect("拉高顶住上边（resize 带出来的 move）→ 不贴边", nil, at: 4.2)
+
+        // ④ 等 resize 抑制窗过去之后，纯平移（尺寸不变，免得又触发 resize）到顶 → 该贴顶
+        //    注意：上一步把窗口拉成了 760 高，这里必须沿用 760，否则 place 本身就是一次缩放
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.6) {
+            place(NSRect(x: vf.midX - w / 2, y: vf.maxY - 760 - 20, width: w, height: 760))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                place(NSRect(x: vf.midX - w / 2, y: vf.maxY - 760, width: w, height: 760))
+                fakeMove()
+            }
+        }
+        expect("抑制窗过后的纯拖动 → 贴顶", .top, at: 5.6)
+
+        // ⑤ 收起 + 唤出的尺寸：唤出不得比可见区还高（现存存档就是 768×900 > 875）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
+            self.peekEdge = .top
+            self.collapse()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                let f = p.frame
+                print("\(abs(f.height - Self.peekThickness) < 1 ? "PASS" : "FAIL") 收起 → \(Int(f.width))×\(Int(f.height))（厚 \(Int(Self.peekThickness))）")
+                if abs(f.height - Self.peekThickness) >= 1 { fails += 1 }
+                self.expandedFrame = NSRect(x: vf.minX + 300, y: vf.minY - 500, width: 768, height: 900)
+                self.expand()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                    let g = p.frame
+                    let ok = g.height <= vf.height + 0.5 && g.maxY <= vf.maxY + 0.5
+                    print("\(ok ? "PASS" : "FAIL") 唤出 768×900 → 夹成 \(Int(g.width))×\(Int(g.height))（可见区高 \(Int(vf.height))）")
+                    if !ok { fails += 1 }
+                    print("LINK5 链路用例 \(fails == 0 ? "全部通过" : "有 \(fails) 条不通过")")
+                    NSApp.terminate(nil)
+                }
+            }
         }
     }
 
@@ -2974,31 +3170,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let vf = visibleFrame
         let f = p.frame
         let gaps: [(PeekEdge, CGFloat)] = [
+            (.top, vf.maxY - f.maxY),        // 顺序即平票优先级：他最常贴的是顶
+            (.bottom, f.minY - vf.minY),
             (.left, f.minX - vf.minX),
             (.right, vf.maxX - f.maxX),
-            (.bottom, f.minY - vf.minY),
-            (.top, vf.maxY - f.maxY),
         ]
-        // 只在「确实像想停靠」的边里挑最近的一条。窗口本身已经占掉该方向可见区 72% 以上时，
-        // 撞上边只是把窗口拉高/拉大的副产品，不算停靠意愿 —— 13:01 那次就是把窗口拉到 869 高
-        // 顶住了上边，被当成贴顶，收成一条横线弹到屏幕最上面。
-        let eligible = gaps.filter { !Self.incidental($0.0, f, vf) }
-        guard let best = eligible.min(by: { $0.1 < $1.1 }) else { peekEdge = nil; return }
-        if best.1 <= Self.snapGap {
-            if peekEdge != best.0 { peekEdge = best.0; store.flash("已贴边：\(best.0.name)，鼠标移开会自动收起") }
-            snap(best.0)
-        } else if best.1 > Self.releaseGap {
+        switch Self.decideSnap(gaps, bias: dragBias, drag: dragDistance) {
+        case .snap(let edge):
+            if peekEdge != edge {
+                peekEdge = edge
+                store.flash("已\(edge.name)：鼠标移开自动收起，压到窄条展开")
+            }
+            snap(edge)
+        case .release:
             peekEdge = nil
             outsideSince = nil
+        case .hold:
+            break
         }
     }
 
-    /// 该方向已经占了可见区 72% 以上 → 碰到这条边属于「顺便」，不是想停靠
-    nonisolated static func incidental(_ edge: PeekEdge, _ f: NSRect, _ vf: NSRect) -> Bool {
-        switch edge {
-        case .left, .right: return f.width > vf.width * 0.72
-        case .top, .bottom: return f.height > vf.height * 0.72
-        }
+    // 嵌套类型不继承外层的 actor 隔离，所以不用 nonisolated；
+    // 但要能被 nonisolated 的纯函数和文件级用例表用
+    enum SnapDecision: Equatable {
+        case snap(PeekEdge), hold, release
+    }
+
+    /// 贴边判定：抽成纯函数，好用假坐标钉死规则（WECAL_PEEK_TEST=4）。
+    /// gaps 的顺序就是平票时的优先级。
+    /// bias = 这次拖动的方向。窗口拉满一屏高时上下间隙同为 0，几何上分不出
+    /// 「想贴顶」还是「顺便撞边」，只能看他往哪个方向拖 —— 这也是为什么不用
+    /// 「该方向占可见区超过 72% 就算顺便」那种占比规则：菲哥的窗口本来就和屏幕
+    /// 一样高（768×900 / 可见区 900），占比规则会把他真实的贴顶一起封死（2026-11-22 踩到）。
+    nonisolated static func decideSnap(_ gaps: [(PeekEdge, CGFloat)],
+                                       bias: PeekEdge?,
+                                       drag: CGFloat) -> SnapDecision {
+        let touching = gaps.filter { $0.1 <= snapGap }
+        if let b = bias, drag > 2, touching.contains(where: { $0.0 == b }) { return .snap(b) }
+        if let best = touching.min(by: { $0.1 < $1.1 }) { return .snap(best.0) }
+        if let closest = gaps.map({ $0.1 }).min(), closest > releaseGap { return .release }
+        return .hold
     }
 
     /// 把窗口贴紧某条边（只动那个方向的坐标）
@@ -3025,7 +3236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             peekEdge = nil
             return
         }
-        guard peekEdge != nil, !peekTestMode else { return }
+        guard peekEdge != nil, !peekTestMode, !hoverFrozen else { return }
         // 按住鼠标（正在拖窗口）时不展开也不收起
         if NSEvent.pressedMouseButtons & 1 != 0 { outsideSince = nil; return }
         let mouse = NSEvent.mouseLocation
@@ -3102,8 +3313,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if target.width < 100 || target.height < 100 {
             target = NSRect(x: vf.maxX - width, y: vf.maxY - height, width: width, height: height)
         }
-        target.origin.x = min(max(target.origin.x, vf.minX), max(vf.minX, vf.maxX - target.width))
-        target.origin.y = min(max(target.origin.y, vf.minY), max(vf.minY, vf.maxY - target.height))
+        // 唤出尺寸也夹一次屏：老存档可能比可见区还高，那样一唤出就是「铺满全屏」
+        target = Self.fitToScreen(target, vf)
         store.peeking = false
         outsideSince = nil
         suppressSnapUntil = Date().addingTimeInterval(0.8)
