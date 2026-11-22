@@ -266,19 +266,6 @@ final class Store: ObservableObject {
     @Published var pinned = false
     /// 待办回写进行中标记，避免连点发多次请求
     @Published var busyTodo = false
-    /// 贴边收缩（edge peek）：拖到屏幕边缘后收成一条窄边，鼠标移过去自动展开。
-    /// 收缩态由 AppDelegate 控制窗口尺寸，这里只管「现在该画窄条还是画完整界面」。
-    @Published var peeking = false
-    /// 窄条是竖的还是横的（左右贴边=竖条，上下贴边=横条）
-    @Published var peekVertical = true
-    /// 功能开关。2026-11-22 定的需求，默认开；菜单里可关。
-    @Published var peekEnabled: Bool =
-        (UserDefaults.standard.object(forKey: "wecal.peek.enabled") as? Bool) ?? true
-
-    func setPeekEnabled(_ v: Bool) {
-        peekEnabled = v
-        UserDefaults.standard.set(v, forKey: "wecal.peek.enabled")
-    }
     /// 时钟。SwiftUI 的 body 只在 @Published 变化时重算，时间自己流逝不会触发任何东西
     /// ——实测踩过：23:30 了那条还写着「今天截止 17:43」，就是因为过期判定用的是
     /// 上一次渲染时的 Date()。所有与「现在」有关的判断统一读 clock，由 startClock 推。
@@ -1194,66 +1181,9 @@ struct ContentView: View {
         }
     }
 
-    /// 收缩态窄条：14pt 的红金书脊。左右贴边=竖条，上下贴边=横条。
-    /// 只放「书」字 + 待办数（有过期再加一个金点），够扫一眼知道里面有没有事。
-    private var peekStrip: some View {
-        ZStack {
-            Theme.redGradient
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .stroke(Theme.todo.opacity(0.5), lineWidth: 1)
-                .padding(1.5)
-            if store.peekVertical {
-                VStack(spacing: 3) {
-                    Text("书")
-                        .font(.system(size: 8, weight: .heavy))
-                        .foregroundColor(.white)
-                    Rectangle().fill(Theme.todo.opacity(0.75)).frame(width: 6, height: 1)
-                    // 竖排逐字渲染时字符串里的空格会占掉一整行，所以这里不写空格
-                    verticalText("待办\(store.openTodos.count)")
-                    Spacer(minLength: 0)
-                    if store.overdueCount > 0 {
-                        Circle().fill(Theme.todo).frame(width: 3.5, height: 3.5)
-                            .shadow(color: Theme.todo.opacity(0.8), radius: 2)
-                    }
-                }
-                .padding(.vertical, 8)
-            } else {
-                HStack(spacing: 4) {
-                    Text("书").font(.system(size: 8, weight: .heavy)).foregroundColor(.white)
-                    Text("待办 \(store.openTodos.count)")
-                        .font(.system(size: 7.5, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.92))
-                    if store.overdueCount > 0 {
-                        Text("· 已过期 \(store.overdueCount)")
-                            .font(.system(size: 7.5, weight: .semibold))
-                            .foregroundColor(Theme.todo)
-                    }
-                }
-                .padding(.horizontal, 6)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .contentShape(Rectangle())
-    }
-
-    /// 竖排文字：中文逐字堆叠，比 rotationEffect 干净（也不会被裁掉半行）
-    private func verticalText(_ s: String) -> some View {
-        VStack(spacing: 1.5) {
-            ForEach(Array(s.enumerated()), id: \.offset) { _, ch in
-                Text(String(ch))
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.95))
-            }
-        }
-    }
-
     var body: some View {
-        // 收缩成窄条时换成 peekStrip：窗口只有 14pt 宽，正常布局会被压烂，
-        // 所以整块内容直接换掉，而不是让它挤成一团
         Group {
-            if store.peeking {
-                peekStrip
-            } else if store.mode == 1 {
+            if store.mode == 1 {
                 RecordPanel()
             } else if store.mode == 2 {
                 NotePanel()
@@ -1273,12 +1203,10 @@ struct ContentView: View {
         // 标题栏是透明的，但 SwiftUI 默认把标题栏那 28pt 当安全区留白，
         // 结果桌面壁纸从顶部漏出来一条（看着像蓝标题栏）。铺满整窗即可
         .ignoresSafeArea(.all)
-        // 收缩态：窗口只有 14pt 厚，18pt 圆角等于把两头剪成胶囊、字被切，
-        // 所以窄条用小圆角（贴边那侧本来也该是方的才贴着屏幕边）
-        .clipShape(RoundedRectangle(cornerRadius: store.peeking ? 5 : Theme.cardRadius, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: store.peeking ? 5 : Theme.cardRadius, style: .continuous)
-                .stroke(Color.white.opacity(store.peeking ? 0.35 : 0.75), lineWidth: 1)
+            RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
+                .stroke(Color.white.opacity(0.75), lineWidth: 1)
         )
         // 回车兜底：输入法组字/未组字两种情况都由 AppDelegate 的按键监视器发信号
         .onChange(of: store.composerSubmitTick) { _ in submitTodo() }
@@ -2585,77 +2513,6 @@ final class VisibleArea: @unchecked Sendable {
     var frame = NSRect(x: 0, y: 0, width: 1440, height: 900)
 }
 
-// MARK: - 贴边判定的用例表（WECAL_PEEK_TEST=4 跑）
-// 真机鼠标位置脚本伪造不了，所以把几何判定抽成纯函数后，用假坐标把规则钉死。
-// 注意：这只能证明「判定算得对」，不能证明「事件真的会送到判定里」——后者仍需真机点一下。
-enum PeekCase {
-    static func runAll() {
-        let expanded = NSRect(x: 1000, y: 100, width: 320, height: 833)   // 贴右的展开态
-        let stripR   = NSRect(x: 1426, y: 100, width: 14, height: 833)    // 贴右收起后
-        let stripT   = NSRect(x: 1000, y: 886, width: 320, height: 14)    // 贴顶收起后
-        var fails = 0
-        func check(_ name: String, _ got: Bool, _ want: Bool) {
-            print("\(got == want ? "PASS" : "FAIL") \(name)（期望 \(want)，实得 \(got)）")
-            if got != want { fails += 1 }
-        }
-        let expR = AppDelegate.peekExpandZone(stripR)
-        let expT = AppDelegate.peekExpandZone(stripT)
-        // —— 展开态：界面边界就是界线，出界立刻算走开（peekHold 只留 0.15s 防抖） ——
-        check("指针在窗口里", expanded.contains(NSPoint(x: 1160, y: 500)), true)
-        check("窗口内贴左沿 2pt", expanded.contains(NSPoint(x: 1002, y: 500)), true)
-        check("窗口左外 2pt（立刻算走开）", expanded.contains(NSPoint(x: 998, y: 500)), false)
-        check("窗口左外 20pt（早该收了）", expanded.contains(NSPoint(x: 980, y: 500)), false)
-        check("窗口内贴下沿 2pt", expanded.contains(NSPoint(x: 1160, y: 102)), true)
-        check("窗口下外 2pt（立刻算走开）", expanded.contains(NSPoint(x: 1160, y: 98)), false)
-        // —— 收起态：什么算「鼠标移过去」 ——
-        check("正压在竖窄条上", expR.contains(NSPoint(x: 1433, y: 500)), true)
-        check("窄条左外 4pt（留的边，应唤出）", expR.contains(NSPoint(x: 1422, y: 500)), true)
-        check("窄条左外 10pt（超出留边，不弹）", expR.contains(NSPoint(x: 1416, y: 500)), false)
-        check("指针顶到屏幕最右沿", expR.contains(NSPoint(x: 1439.5, y: 500)), true)
-        check("屏幕中间（不该老远就弹开）", expR.contains(NSPoint(x: 700, y: 500)), false)
-        // 竖窄条的 y 范围是 100..933，所以「条外」要从 933 往上算
-        check("竖条上端外 4pt（留的边）", expR.contains(NSPoint(x: 1433, y: 937)), true)
-        check("竖条上端外 10pt（不弹）", expR.contains(NSPoint(x: 1433, y: 943)), false)
-        check("竖条下端外 4pt（留的边）", expR.contains(NSPoint(x: 1433, y: 96)), true)
-        // —— 贴顶横条 ——
-        check("横条下方 4pt（留的边）", expT.contains(NSPoint(x: 1160, y: 882)), true)
-        check("横条下方 12pt（超出留边，不弹）", expT.contains(NSPoint(x: 1160, y: 874)), false)
-        check("顶边沿", expT.contains(NSPoint(x: 1160, y: 899)), true)
-        // —— 贴边判定：窗口拉满一屏高时，几何上上下间隙都是 0，只能靠拖动方向定 ---
-        let vf = NSRect(x: 0, y: 0, width: 1440, height: 875)   // 1440×900 屏减掉菜单栏
-        func gapsOf(_ f: NSRect) -> [(AppDelegate.PeekEdge, CGFloat)] {
-            [(.top, vf.maxY - f.maxY), (.bottom, f.minY - vf.minY),
-             (.left, f.minX - vf.minX), (.right, vf.maxX - f.maxX)]
-        }
-        func decide(_ name: String, _ f: NSRect, bias: AppDelegate.PeekEdge?, drag: CGFloat,
-                    _ want: AppDelegate.SnapDecision) {
-            let got = AppDelegate.decideSnap(gapsOf(f), bias: bias, drag: drag)
-            print("\(got == want ? "PASS" : "FAIL") \(name)（期望 \(want)，实得 \(got)）")
-            if got != want { fails += 1 }
-        }
-        let full = NSRect(x: 336, y: 0, width: 768, height: 875)   // 和可见区一样高
-        decide("拉满一屏 + 往上拖 → 贴顶", full, bias: .top, drag: 40, .snap(.top))
-        decide("拉满一屏 + 往下拖 → 贴底", full, bias: .bottom, drag: 40, .snap(.bottom))
-        decide("拉满一屏 + 没有拖动方向（启动恢复）→ 按优先级贴顶", full, bias: nil, drag: 0, .snap(.top))
-        decide("贴顶但这次是横着拖（bias 没贴着）→ 仍贴几何上贴到的边",
-               full, bias: .right, drag: 40, .snap(.top))
-        decide("只贴左边、拖着方向是往上 → 不能被 bias 掰成贴顶",
-               NSRect(x: 0, y: 200, width: 320, height: 520), bias: .top, drag: 30, .snap(.left))
-        // 顶边留 30pt（在 18pt 吸附区外）、底边留 145pt、左右各 336pt → 应该什么都不做
-        decide("离顶 30pt（在吸附区外）→ 先不动",
-               NSRect(x: 336, y: 145, width: 768, height: 700), bias: .top, drag: 40, .hold)
-        decide("四边都超过 50pt → 解除贴边态",
-               NSRect(x: 336, y: 120, width: 768, height: 600), bias: .top, drag: 40, .release)
-        // —— 唤出尺寸不能比屏幕还高（现存那份 768×900 就是） ——
-        let fitted = AppDelegate.fitToScreen(NSRect(x: 336, y: 0, width: 768, height: 900), vf)
-        check("768×900 在 875 高的可见区里 → 高被夹到 875", abs(fitted.height - 875) < 0.5, true)
-        check("夹完不超屏", fitted.maxY <= vf.maxY + 0.5, true)
-        let keep = AppDelegate.fitToScreen(NSRect(x: 100, y: 100, width: 384, height: 560), vf)
-        check("常规 384×560 原样保留", keep == NSRect(x: 100, y: 100, width: 384, height: 560), true)
-        print("PEEK_TEST=4 用例 \(fails == 0 ? "全部通过" : "有 \(fails) 条不通过")")
-    }
-}
-
 // MARK: - 应用入口
 
 final class Panel: NSPanel {
@@ -2682,8 +2539,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     nonisolated static let maxH: CGFloat = 1040
 
     /// 尺寸上限要再被屏幕可见区夹一道。之前只夹 maxW/maxH（768/1040），
-    /// 于是在 1440×900 这种屏上能把窗口拉得比可见区还高（现存那份 768×900 就比
-    /// 可见区高了约 25pt，顶部压在菜单栏底下），贴边唤出看着就像「自动铺满全屏」。
+    /// 于是在 1440×900 这种屏上能把窗口拉得比可见区还高（顶部压在菜单栏底下）。
     nonisolated static func fitToScreen(_ f: NSRect, _ vf: NSRect) -> NSRect {
         var g = f
         // 上限 = maxW 与「屏幕可见区」里较小的那个，但不能低于下限本身
@@ -2696,14 +2552,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return g
     }
 
-    // MARK: 窗口尺寸持久化（只存展开态）
+    // MARK: 窗口尺寸持久化
 
     private static let frameKey = "wecal.frame"
     private var saveFrameWork: DispatchWorkItem?
 
-    /// 记住窗口位置/大小。收缩态（14pt 窄条）一律不存，否则下次启动就是一条细线。
+    /// 记住窗口位置/大小
     func saveFrame() {
-        guard let p = panel, !store.peeking else { return }
+        guard let p = panel else { return }
         let f = p.frame
         guard f.width >= Self.minW - 1, f.height >= Self.minH - 1 else { return }
         UserDefaults.standard.set(NSStringFromRect(f), forKey: Self.frameKey)
@@ -2720,7 +2576,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func restoreFrame(_ p: NSWindow) {
         let vf = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        // 第二个来源是旧版本的 NSWindow autosave 键：值正常（不是收缩态的 14 宽）就继承一次
+        // 第二个来源是旧版本的 NSWindow autosave 键：尺寸正常就继承一次
         let saved = [UserDefaults.standard.string(forKey: Self.frameKey),
                      UserDefaults.standard.string(forKey: "NSWindow Frame WeComCalendarWidget")]
         for s in saved.compactMap({ $0 }) {
@@ -2735,65 +2591,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.setContentSize(NSSize(width: width, height: height))
     }
 
-    // MARK: 贴边收缩（edge peek）
-    enum PeekEdge: Equatable {
-        case left, right, top, bottom
-        var vertical: Bool { self == .left || self == .right }
-        var name: String {
-            switch self {
-            case .left: return "贴左"
-            case .right: return "贴右"
-            case .top: return "贴顶"
-            case .bottom: return "贴底"
-            }
-        }
-    }
-    /// 当前贴的是哪条边；nil = 没贴边，不做任何自动收起
-    private var peekEdge: PeekEdge?
-    /// 收起前的完整尺寸，展开时按它恢复
-    private var expandedFrame: NSRect = .zero
-    private var peekTimer: Timer?
-    /// 鼠标离开界面的起始时刻（连续离开超过 peekHold 才收，避免压过一条线就闪）
-    private var outsideSince: Date?
-    /// 我们自己 setFrame 期间屏蔽「贴边判定」，否则展开动画的中间帧会被判成「离开边缘」
-    private var suppressSnapUntil = Date.distantPast
-    /// 缩放结束后的这段时间里，跟来的 windowDidMove 一律当缩放的副产品忽略
-    private var resizeSettleUntil = Date.distantPast
-    nonisolated static let resizeSettle: TimeInterval = 0.5
-    /// 上一次 move 到的位置，用来算拖动方向（决定拉满一屏时贴哪条边）
-    private var lastFrameOrigin: NSPoint = .zero
-    private var dragBias: PeekEdge?
-    private var dragDistance: CGFloat = 0
-    // 下面几个几何常量被 nonisolated 的纯函数（peekExpandZone / decideSnap）用到，
-    // 而整个类是 @MainActor —— 不加 nonisolated 在 Swift 6 严格并发下是编译错误。
-    // 它们都是编译期常量，nonisolated 是安全的，也让贴边几何能脱离主线程单测。
-    /// 窄条厚度
-    nonisolated static let peekThickness: CGFloat = 14
-    /// 离边多近算想贴上去 / 离边多远算不贴了
-    nonisolated static let snapGap: CGFloat = 18
-    nonisolated static let releaseGap: CGFloat = 50
-    /// 窄条唤出命中区的外扩量：只要「压到那条线」就算要看，但不能宽到路过就弹
-    /// （16pt 时被否掉了：鼠标沿屏幕边走路都会把界面撑开）
-    nonisolated static let peekHotSlack: CGFloat = 6
-    /// 指针离开界面后到收起的等待。只留一个轮询周期多一点（0.12s/次）做防抖，
-    /// 语义上就是「一出界面马上缩回去」
-    nonisolated static let peekHold: TimeInterval = 0.15
-    private var peekTestMode = false
-    /// 只冻结 hover 自动收/展（拍图时用），不影响贴边判定。
-    /// 之前共用 peekTestMode 一个开关，把 considerSnap 也一起挡了 ——
-    /// 结果链路测试里「往上拖到顶」永远判成不贴边（2026-11-22 由 WECAL_PEEK_TEST=5 抓到）
-    private var hoverFrozen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 验收钩子：记事本数据层的用例表，临时目录里跑，不建窗口
         if ProcessInfo.processInfo.environment["WECAL_NOTES_TEST"] == "1" {
             NoteStore.runSelfTest()   // 内部 exit(0/1)，不返回
-            return
-        }
-        // 验收钩子 4：只跑贴边判定的用例表，不建窗口、跑完即退
-        if ProcessInfo.processInfo.environment["WECAL_PEEK_TEST"] == "4" {
-            PeekCase.runAll()
-            NSApp.terminate(nil)
             return
         }
         NSApp.setActivationPolicy(.regular)
@@ -2853,10 +2655,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         p.contentView = host
 
-        // 只有首次启动（无历史尺寸）才用默认尺寸；否则保留用户拖拽后的宽高
-        // 尺寸自己存（用户默认值 wecal.frame），不用 NSWindow 的 autosave：
-        // autosave 在每次 frame 变化时都会写，收缩成 14pt 窄条那一刻也会写进去，
-        // 于是退出时若正处于收起态，下次启动窗口就只有 14 宽（2026-11-22 踩到）。
+        // 只有首次启动（无历史尺寸）才用默认尺寸；否则保留用户拖拽后的宽高。
+        // 尺寸自己存（用户默认值 wecal.frame），不用 NSWindow 的 autosave ——
+        // autosave 在每次 frame 变化时都会写，保存时机完全不受控。
         restoreFrame(p)
         // 验收用钩子：WECAL_SIZE="480x700" 直接指定内容尺寸（仅调试时用，正常启动不设该变量）
         if let spec = ProcessInfo.processInfo.environment["WECAL_SIZE"] {
@@ -2867,8 +2668,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         // 兜底：恢复出来的位置可能贴着屏幕顶（标题区被菜单栏压住），
-        // 或者换过显示器后跑到屏幕外，这里统一拉回可见区域
+        // 或者换过显示器后跑到屏幕外，这里统一拉回可见区域。
+        // 顺手把可见区写进中转站，给非隔离的 windowWillResize 用。
         if let vf = NSScreen.main?.visibleFrame {
+            VisibleArea.shared.frame = vf
             var f = p.frame
             f.origin.x = min(max(f.origin.x, vf.minX), max(vf.minX, vf.maxX - f.width))
             f.origin.y = min(max(f.origin.y, vf.minY), max(vf.minY, vf.maxY - f.height))
@@ -2893,40 +2696,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         // 「重启」这类动作必须留痕：事后只看界面是分不清「没点到」「点了没生效」的
         // （回调已在 applicationDidFinishLaunching 开头接好，这里不再重复赋值）
-        // 拖动方向的基准：不初始化成当前位置的话，第一次 move 会算出一个巨大的位移
-        lastFrameOrigin = p.frame.origin
-
-        // 验收钩子 5：把「拖动 vs 缩放」这两条事件链路跑成真证据。
-        // 用例表（=4）只能证明纯函数算得对，证明不了事件送得到 —— 这里直接喂 delegate 回调。
-        if ProcessInfo.processInfo.environment["WECAL_PEEK_TEST"] == "5" {
-            hoverFrozen = true      // 注意：这里不能设 peekTestMode，那会连贴边判定一起挡掉
-            runPeekEventChain(p)
-        }
-
-        // 验收钩子：WECAL_PEEK_TEST=1 启动后贴右边并收起（拍竖窄条）；=2 收起后再展开（验恢复尺寸）；
-        // =3 贴顶收起（拍横窄条，走的是另一套 HStack 布局，最容易溢出）。
-        // 鼠标位置没法伪造，所以测试态直接跳过 hover 判定，只验外观与恢复尺寸。
-        if let pt = ProcessInfo.processInfo.environment["WECAL_PEEK_TEST"], pt == "1" || pt == "2" || pt == "3" {
-            peekTestMode = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
-                var f = p.frame
-                if pt == "3" {
-                    f.origin.y = self.visibleFrame.maxY - f.height
-                } else {
-                    f.origin.x = self.visibleFrame.maxX - f.width
-                }
-                p.setFrame(f, display: true)
-                self.peekEdge = (pt == "3") ? .top : .right
-                self.collapse()
-                print("PEEK_TEST 收起后 frame=\(p.frame)")
-                if pt == "2" {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                        self.expand()
-                        print("PEEK_TEST 展开后 frame=\(p.frame)")
-                    }
-                }
-            }
-        }
         // 验收钩子：WECAL_TEST_REMINDER=1 弹日程卡（不该有延期排），
         // =2 弹待办卡（该有延期排）。用环境变量而不是点菜单，避免 CGEvent 误点别的应用。
         if let tv = ProcessInfo.processInfo.environment["WECAL_TEST_REMINDER"], tv == "1" || tv == "2" {
@@ -3049,12 +2818,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 let ws = NSApp.windows.filter { $0.isVisible && $0.contentView != nil }
                 var n = 0
-                // 收缩态窄条只有 14pt 宽，40 的门槛会把主面板自己滤掉 → 验收态放宽到 10
-                let minSide: CGFloat = self.peekTestMode ? 10 : 40
                 for w in ws {
                     guard let cv = w.contentView else { continue }
                     let b = cv.bounds
-                    guard b.width > minSide, b.height > minSide else { continue }
+                    // 太小的（状态栏图标之类）不是要看的界面，滤掉
+                    guard b.width > 40, b.height > 40 else { continue }
                     let path = wSnap.replacingOccurrences(of: ".png", with: ".\(n).png")
                     if let rep = cv.bitmapImageRepForCachingDisplay(in: b) {
                         cv.cacheDisplay(in: b, to: rep)
@@ -3176,20 +2944,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store.startAutoSync()
         installReturnMonitor()
         installPasteMonitor()
-        startPeekWatching()
-        // 上次退出时窗口本来就贴在边上：重启后不会再收到 windowDidMove，
-        // 不主动判一次的话「贴边」这个状态一重启就丢了（要等下次拖窗口才恢复）
+        // 刚点过「重启书办」：等界面稳住再把面板摆到前面，否则重启成功了也像「什么都没发生」
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            guard let self else { return }
-            // 刚点过「重启书办」：把面板摆到前面让人看见，别 1.2 秒后又贴边收成 14pt 窄条 ——
-            // 那样重启成功了也像是「什么都没发生」。贴边状态等下次拖窗口自然恢复。
-            if self.store.justRelaunched {
-                self.panel?.makeKeyAndOrderFront(nil)
-                NSApp.activate(ignoringOtherApps: true)
-                self.store.logUI("重启完成：落在第 \(modeName(self.store.mode)) 页，面板已展开")
-                return
-            }
-            self.considerSnap()
+            guard let self, self.store.justRelaunched else { return }
+            self.panel?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            self.store.logUI("重启完成：落在第 \(modeName(self.store.mode)) 页，面板已展开")
         }
 
         // 验收钩子：真往正文里按一次回车，看它有没有变成换行。
@@ -3364,352 +3124,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     nonisolated func windowDidResize(_ notification: Notification) {
         Task { @MainActor [weak self] in
             guard let self, let f = self.panel?.contentView?.frame else { return }
-            // 从下边往上拖高会同时改 origin.y，AppKit 会跟着补发 windowDidMove ——
-            // 那一下不是「他往边上拖」，得压掉，否则「把窗口拉高顶住上边」会被当成贴顶。
-            // 用时间窗而不是标志位：两者在同一次拖拽里交替到达，顺序不可靠。
-            self.resizeSettleUntil = Date().addingTimeInterval(Self.resizeSettle)
             self.store.applyZoom(f.width, f.height)
             self.scheduleSaveFrame()
         }
     }
 
-    /// 窗口被拖动 → 判断要不要贴边
+    /// 拖到别的显示器上时可见区会变，同步给非隔离的 windowWillResize
     nonisolated func windowDidMove(_ notification: Notification) {
         Task { @MainActor [weak self] in
             guard let self, let p = self.panel else { return }
+            if let vf = (p.screen ?? NSScreen.main)?.visibleFrame { VisibleArea.shared.frame = vf }
             self.scheduleSaveFrame()
-            if ProcessInfo.processInfo.environment["WECAL_PEEK_TEST"] == "5" {
-                print("LINK5   ↳ didMove 到达 y=\(Int(p.frame.minY)) resize抑制中=\(Date() < self.resizeSettleUntil) 贴边抑制中=\(Date() < self.suppressSnapUntil)")
-            }
-            if Date() < self.resizeSettleUntil { return }   // 缩放带出来的 move，不算停靠
-            // 记下这次拖动的方向。窗口拉满一屏高时上下间隙都是 0，「贴哪条边」
-            // 光看几何分不出来，只能看他往哪个方向拖。
-            let cur = p.frame
-            let dx = cur.minX - self.lastFrameOrigin.x
-            let dy = cur.minY - self.lastFrameOrigin.y
-            self.lastFrameOrigin = cur.origin
-            self.dragDistance = max(abs(dx), abs(dy))
-            if abs(dx) >= abs(dy) {
-                self.dragBias = abs(dx) < 2 ? nil : (dx > 0 ? .right : .left)   // Cocoa x 向右增大
-            } else {
-                self.dragBias = abs(dy) < 2 ? nil : (dy > 0 ? .top : .bottom)   // y 向上增大
-            }
-            self.considerSnap()
-        }
-    }
-
-    // MARK: 贴边收缩实现
-
-    private var visibleFrame: NSRect {
-        let r = (panel?.screen ?? NSScreen.main)?.visibleFrame
-            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        VisibleArea.shared.frame = r   // 给非隔离的 windowWillResize 用
-        return r
-    }
-
-    /// 0.12 秒一次轮询鼠标位置。用 NSEvent.mouseLocation 而不是全局事件监听：
-    /// 不需要辅助功能权限，逻辑也集中在一处。
-    func startPeekWatching() {
-        peekTimer?.invalidate()
-        peekTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.peekTick() }
-        }
-    }
-
-    /// 喂假事件跑贴边链路，逐步打日志（WECAL_PEEK_TEST=5）。
-    /// 坐标全部按当前屏幕可见区算，不写死数字。
-    private func runPeekEventChain(_ p: NSWindow) {
-        let vf = visibleFrame
-        var fails = 0
-        func say(_ s: String) { print("LINK5 \(s)") }
-        func expect(_ name: String, _ want: PeekEdge?, at t: TimeInterval) {
-            DispatchQueue.main.asyncAfter(deadline: .now() + t) {
-                let got = self.peekEdge
-                if got != want {
-                    let vf = self.visibleFrame
-                    let f = p.frame
-                    say("诊断 @\(String(format: "%.1f", t)) frame=\(Int(f.minX)),\(Int(f.minY)),\(Int(f.width))×\(Int(f.height))"
-                        + " 间隙 顶\(Int(vf.maxY - f.maxY)) 底\(Int(f.minY - vf.minY)) 左\(Int(f.minX - vf.minX)) 右\(Int(vf.maxX - f.maxX))"
-                        + " peekEnabled=\(self.store.peekEnabled) peeking=\(self.store.peeking)"
-                        + " 抑制中=\(Date() < self.suppressSnapUntil) resize抑制中=\(Date() < self.resizeSettleUntil)"
-                        + " 方向=\(self.dragBias.map { $0.name } ?? "nil") 位移=\(Int(self.dragDistance))")
-                }
-                let ok = got == want
-                let w = want.map { $0.name } ?? "nil"
-                let g = got.map { $0.name } ?? "nil"
-                print("\(ok ? "PASS" : "FAIL") 链路 \(name)（期望 \(w)，实得 \(g)）")
-                if !ok { fails += 1 }
-            }
-        }
-        func place(_ r: NSRect) {
-            self.suppressSnapUntil = Date().addingTimeInterval(0.05)
-            p.setFrame(r, display: true)
-        }
-        func fakeMove() {
-            self.suppressSnapUntil = .distantPast
-            self.windowDidMove(Notification(name: NSWindow.didMoveNotification, object: p))
-        }
-        let w: CGFloat = 560, h: CGFloat = 700
-        let mid = NSRect(x: vf.midX - w / 2, y: vf.minY + 60, width: w, height: h)
-        let touchTop = NSRect(x: vf.midX - w / 2, y: vf.maxY - h, width: w, height: h)
-        let belowTop = NSRect(x: vf.midX - w / 2, y: vf.maxY - h - 20, width: w, height: h)
-        say("开始：可见区 \(Int(vf.width))×\(Int(vf.height))，测试窗口 \(Int(w))×\(Int(h))")
-
-        // ① 摆在中间，四条边都没碰 → 不该有任何贴边
-        peekEdge = nil
-        place(mid)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { fakeMove() }
-        expect("摆在中间拖着 → 不贴边", nil, at: 1.1)
-
-        // ② 往上拖到顶 → 该判成贴顶（这就是菲哥要的「顶部贴边能收进去」）
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            self.peekEdge = nil
-            place(belowTop)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                place(touchTop)
-                fakeMove()
-            }
-        }
-        expect("往上拖到顶 → 贴顶", .top, at: 2.6)
-
-        // ③ 把窗口顶边往上拖大（拉高）→ AppKit 会补发 move，这一下不该算停靠
-        //    就是 13:01 那次「拉高窗口被收成一条横线弹到屏幕顶」的回归
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-            self.peekEdge = nil
-            place(NSRect(x: vf.midX - w / 2, y: vf.maxY - h - 60, width: w, height: h))
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                // 拖窗口上边把高度从 700 拉到 760，同时 origin.y 上移 → resize + move 成对出现
-                let grown = NSRect(x: vf.midX - w / 2, y: vf.maxY - 760, width: w, height: 760)
-                self.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: p))
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    self.suppressSnapUntil = Date().addingTimeInterval(0.05)
-                    p.setFrame(grown, display: true)
-                    self.windowDidMove(Notification(name: NSWindow.didMoveNotification, object: p))
-                }
-            }
-        }
-        expect("拉高顶住上边（resize 带出来的 move）→ 不贴边", nil, at: 4.2)
-
-        // ④ 等 resize 抑制窗过去之后，纯平移（尺寸不变，免得又触发 resize）到顶 → 该贴顶
-        //    注意：上一步把窗口拉成了 760 高，这里必须沿用 760，否则 place 本身就是一次缩放
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.6) {
-            place(NSRect(x: vf.midX - w / 2, y: vf.maxY - 760 - 20, width: w, height: 760))
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                place(NSRect(x: vf.midX - w / 2, y: vf.maxY - 760, width: w, height: 760))
-                fakeMove()
-            }
-        }
-        expect("抑制窗过后的纯拖动 → 贴顶", .top, at: 5.6)
-
-        // ⑤ 收起 + 唤出的尺寸：唤出不得比可见区还高（现存存档就是 768×900 > 875）
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
-            self.peekEdge = .top
-            self.collapse()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                let f = p.frame
-                print("\(abs(f.height - Self.peekThickness) < 1 ? "PASS" : "FAIL") 收起 → \(Int(f.width))×\(Int(f.height))（厚 \(Int(Self.peekThickness))）")
-                if abs(f.height - Self.peekThickness) >= 1 { fails += 1 }
-                self.expandedFrame = NSRect(x: vf.minX + 300, y: vf.minY - 500, width: 768, height: 900)
-                self.expand()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                    let g = p.frame
-                    let ok = g.height <= vf.height + 0.5 && g.maxY <= vf.maxY + 0.5
-                    print("\(ok ? "PASS" : "FAIL") 唤出 768×900 → 夹成 \(Int(g.width))×\(Int(g.height))（可见区高 \(Int(vf.height))）")
-                    if !ok { fails += 1 }
-                    print("LINK5 链路用例 \(fails == 0 ? "全部通过" : "有 \(fails) 条不通过")")
-                    NSApp.terminate(nil)
-                }
-            }
-        }
-    }
-
-    /// 拖到边缘附近 → 记住贴哪条边并对齐；拖离边缘超过 releaseGap → 解除贴边态
-    func considerSnap() {
-        guard let p = panel, p.isVisible, !p.isMiniaturized else { return }
-        guard store.peekEnabled else { peekEdge = nil; return }
-        if store.peeking { return }
-        if peekTestMode || Date() < suppressSnapUntil { return }
-        let vf = visibleFrame
-        let f = p.frame
-        let gaps: [(PeekEdge, CGFloat)] = [
-            (.top, vf.maxY - f.maxY),        // 顺序即平票优先级：他最常贴的是顶
-            (.bottom, f.minY - vf.minY),
-            (.left, f.minX - vf.minX),
-            (.right, vf.maxX - f.maxX),
-        ]
-        switch Self.decideSnap(gaps, bias: dragBias, drag: dragDistance) {
-        case .snap(let edge):
-            if peekEdge != edge {
-                peekEdge = edge
-                store.flash("已\(edge.name)：鼠标移开自动收起，压到窄条展开")
-            }
-            snap(edge)
-        case .release:
-            peekEdge = nil
-            outsideSince = nil
-        case .hold:
-            break
-        }
-    }
-
-    // 嵌套类型不继承外层的 actor 隔离，所以不用 nonisolated；
-    // 但要能被 nonisolated 的纯函数和文件级用例表用
-    enum SnapDecision: Equatable {
-        case snap(PeekEdge), hold, release
-    }
-
-    /// 贴边判定：抽成纯函数，好用假坐标钉死规则（WECAL_PEEK_TEST=4）。
-    /// gaps 的顺序就是平票时的优先级。
-    /// bias = 这次拖动的方向。窗口拉满一屏高时上下间隙同为 0，几何上分不出
-    /// 「想贴顶」还是「顺便撞边」，只能看他往哪个方向拖 —— 这也是为什么不用
-    /// 「该方向占可见区超过 72% 就算顺便」那种占比规则：菲哥的窗口本来就和屏幕
-    /// 一样高（768×900 / 可见区 900），占比规则会把他真实的贴顶一起封死（2026-11-22 踩到）。
-    nonisolated static func decideSnap(_ gaps: [(PeekEdge, CGFloat)],
-                                       bias: PeekEdge?,
-                                       drag: CGFloat) -> SnapDecision {
-        let touching = gaps.filter { $0.1 <= snapGap }
-        if let b = bias, drag > 2, touching.contains(where: { $0.0 == b }) { return .snap(b) }
-        if let best = touching.min(by: { $0.1 < $1.1 }) { return .snap(best.0) }
-        if let closest = gaps.map({ $0.1 }).min(), closest > releaseGap { return .release }
-        return .hold
-    }
-
-    /// 把窗口贴紧某条边（只动那个方向的坐标）
-    private func snap(_ edge: PeekEdge) {
-        guard let p = panel else { return }
-        let vf = visibleFrame
-        var f = p.frame
-        switch edge {
-        case .left:   f.origin.x = vf.minX
-        case .right:  f.origin.x = vf.maxX - f.width
-        case .top:    f.origin.y = vf.maxY - f.height
-        case .bottom: f.origin.y = vf.minY
-        }
-        if f != p.frame {
-            suppressSnapUntil = Date().addingTimeInterval(0.2)
-            p.setFrame(f, display: true)
-        }
-    }
-
-    private func peekTick() {
-        guard let p = panel, p.isVisible, !p.isMiniaturized else { return }
-        guard store.peekEnabled else {
-            if store.peeking { expand() }
-            peekEdge = nil
-            return
-        }
-        guard peekEdge != nil, !peekTestMode, !hoverFrozen else { return }
-        // 按住鼠标（正在拖窗口）时不展开也不收起
-        if NSEvent.pressedMouseButtons & 1 != 0 { outsideSince = nil; return }
-        let mouse = NSEvent.mouseLocation
-        if store.peeking {
-            // 窄条只有 14pt，指针要「靠近」就能唤出界面，所以命中区往外垫 16pt；
-            // 贴边那侧指针可以顶到屏幕外沿，本来就丢不了
-            if Self.peekExpandZone(p.frame).contains(mouse) { expand(); outsideSince = nil }
-            return
-        }
-        // 附属窗口（改期弹层 / 删除确认框 / 菜单）是独立窗口，指针在它们上面时
-        // mouseLocation 不在主面板内；不豁免的话一点开就被收走、弹层跟着作废
-        if auxiliaryWindowOpen { outsideSince = nil; return }
-        // 展开态判定就用窗口边界本身：指针出了界面就开始倒计时（peekHold 只有 0.15s，
-        // 相当于立刻缩回）。曾经给过 28pt 缓冲 + 1.6s 延迟，被否掉：
-        // 「鼠标移开界面就应该马上缩回去」，缓冲留着反而像界面自己赖着不放。
-        if p.frame.contains(mouse) { outsideSince = nil; return }
-        if let t = outsideSince {
-            if Date().timeIntervalSince(t) > Self.peekHold { collapse() }
-        } else {
-            outsideSince = Date()
-        }
-    }
-
-    // MARK: 下面两个判定抽成纯函数：真机鼠标没法用脚本伪造，但几何逻辑可以用假坐标跑用例表
-
-    /// 收起态下指针落在哪片区域就该把界面唤出来
-    nonisolated static func peekExpandZone(_ f: NSRect) -> NSRect {
-        f.insetBy(dx: -peekHotSlack, dy: -peekHotSlack)
-    }
-    /// 有没有附属窗口正在被使用（弹层、确认框、菜单、选文件的对话框）
-    private var auxiliaryWindowOpen: Bool {
-        for w in NSApp.windows where w.isVisible && w !== panel {
-            let cls = String(describing: type(of: w))
-            if cls.contains("Popover") || cls.contains("Alert")
-                || cls.contains("Sheet") || cls.contains("Menu")
-                // 记事本「贴图」会拉出 NSOpenPanel：鼠标这时压在对话框上，
-                // 不豁免的话面板会在取文件的过程中缩成 14pt 窄条
-                || cls.contains("OpenPanel") || cls.contains("SavePanel") { return true }
-        }
-        return false
-    }
-
-    private func collapse() {
-        // 录制中不收：收成 14pt 窄条后底栏那颗「停止」就点不到了
-        guard !recorder.isRecording else { return }
-        guard let p = panel, let edge = peekEdge, !store.peeking else { return }
-        var f = p.frame
-        let vf = visibleFrame
-        if edge.vertical { f.size.width = Self.peekThickness } else { f.size.height = Self.peekThickness }
-        switch edge {
-        case .left:   f.origin.x = vf.minX
-        case .right:  f.origin.x = vf.maxX - f.size.width
-        case .top:    f.origin.y = vf.maxY - f.size.height
-        case .bottom: f.origin.y = vf.minY
-        }
-        // 指针正压在窄条即将占的位置上（贴右、指针顶在屏幕最右边最常见）：
-        // 现在收下去下一帧就命中热区又弹回来，来回抖 → 干脆先不收，重置倒计时
-        if !peekTestMode,
-           Self.peekExpandZone(f).contains(NSEvent.mouseLocation) {
-            outsideSince = Date()
-            return
-        }
-        expandedFrame = p.frame
-        store.peekVertical = edge.vertical
-        store.peeking = true
-        outsideSince = nil
-        suppressSnapUntil = Date().addingTimeInterval(0.8)
-        p.styleMask.remove(.resizable)          // 窄条上别让人拖出个宽条
-        p.minSize = NSSize(width: 1, height: 1)  // 否则 setFrame 会被下限夹回去
-        p.contentMinSize = NSSize(width: 1, height: 1)
-        p.setFrame(f, display: true, animate: true)
-        store.logUI("\(edge.name)收起 → \(Int(f.width))×\(Int(f.height))")
-        // 收起来就算「这次操作结束」：页面退回日历。
-        // 否则鼠标一靠近窄条就展开成上次那张录屏页，看着像「老是自动切到这个画面」。
-        // 正在录 / 倒计时 / 收尾 / 自检时不退，免得把正在看的结果页刷掉。
-        if store.mode == 1 && !recorder.isBusy && !recorder.checking {
-            store.mode = 0
-        }
-    }
-
-    private func expand() {
-        guard let p = panel, store.peeking else { return }
-        let vf = visibleFrame
-        var target = expandedFrame
-        if target.width < 100 || target.height < 100 {
-            target = NSRect(x: vf.maxX - width, y: vf.maxY - height, width: width, height: height)
-        }
-        // 唤出尺寸也夹一次屏：老存档可能比可见区还高，那样一唤出就是「铺满全屏」
-        target = Self.fitToScreen(target, vf)
-        store.peeking = false
-        outsideSince = nil
-        suppressSnapUntil = Date().addingTimeInterval(0.8)
-        p.styleMask.insert(.resizable)
-        p.setFrame(target, display: true, animate: true)
-        // 尺寸下限要等动画结束再恢复，中途恢复会把窗口夹回 minSize
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            guard let self, let p = self.panel, !self.store.peeking else { return }
-            p.minSize = NSSize(width: Self.minW, height: Self.minH)
-            p.contentMinSize = NSSize(width: Self.minW, height: Self.minH)
-        }
-        store.logUI("展开 → \(Int(target.width))×\(Int(target.height))")
-    }
-
-    @objc private func togglePeek() {
-        store.setPeekEnabled(!store.peekEnabled)
-        if store.peekEnabled {
-            store.flash("贴边收起已开启：把窗口拖到屏幕边上试试")
-        } else {
-            peekEdge = nil
-            if store.peeking { expand() }
-            store.flash("贴边收起已关闭")
         }
     }
 
@@ -3725,10 +3150,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let showHide = sub.addItem(withTitle: "显示 / 隐藏小组件", action: #selector(toggleVisibility), keyEquivalent: "")
         showHide.target = self
-
-        let peekItem = sub.addItem(withTitle: "贴边自动收起", action: #selector(togglePeek), keyEquivalent: "")
-        peekItem.target = self
-        peekItem.state = store.peekEnabled ? .on : .off
 
         let refresh = sub.addItem(withTitle: "刷新企微数据", action: #selector(doRefresh), keyEquivalent: "r")
         refresh.target = self
@@ -3755,7 +3176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return true
     }
 
-    // MARK: 菜单栏常驻图标（收起后可从这里找回）
+    // MARK: 菜单栏常驻图标（窗口被藏起来后可从这儿找回）
 
     private var statusItem: NSStatusItem?
 
@@ -3835,11 +3256,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         pin.target = self
         pin.state = store.pinned ? .on : .off
 
-        let peek = menu.addItem(withTitle: "贴边自动收起", action: #selector(togglePeek), keyEquivalent: "")
-        peek.target = self
-        peek.state = store.peekEnabled ? .on : .off
-        peek.toolTip = "把窗口拖到屏幕边缘，鼠标移开会自动收成一条窄边；移回去即展开"
-
         menu.addItem(.separator())
 
         let test = menu.addItem(withTitle: "预览提醒动画", action: #selector(doTestReminder), keyEquivalent: "")
@@ -3860,7 +3276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 // MARK: - 换包名后的一次性偏好迁移
 
 /// 包名从 `com.fit2cloud.wecomcalendar.widget` 换成 `com.zhanggefei.shuban` 之后，
-/// UserDefaults 会换到全新的 suite —— 不搬的话窗口尺寸、贴边开关、以及**已提醒记录**
+/// UserDefaults 会换到全新的 suite —— 不搬的话窗口尺寸、置顶开关、以及**已提醒记录**
 /// 全部归零，而提醒记录归零的直接后果是历史待办的提醒会重新弹一遍。
 /// 靠 `wecal.migratedFrom` 标记保证只搬一次。
 func migrateLegacyPreferences() {
@@ -3874,12 +3290,12 @@ func migrateLegacyPreferences() {
         moved += 1
     }
     now.set("com.fit2cloud.wecomcalendar.widget", forKey: "wecal.migratedFrom")
-    if moved > 0 { NSLog("书办：从旧包名迁移了 \(moved) 项偏好（窗口尺寸 / 贴边开关 / 提醒记录）") }
+    if moved > 0 { NSLog("书办：从旧包名迁移了 \(moved) 项偏好（窗口尺寸 / 置顶开关 / 提醒记录）") }
 }
 
 // 启动
 MainActor.assumeIsolated {
-    // 必须在 AppDelegate() 之前：Store 在初始化时就会读贴边开关和提醒记录
+    // 必须在 AppDelegate() 之前：Store 在初始化时就会读置顶开关和提醒记录
     migrateLegacyPreferences()
     // 单实例。两份同时跑会各持一份 reminded 去重表（只在启动时读一次 UserDefaults），
     // 同一条提醒弹两遍——23:37 实测过：我的验收实例和正式实例撞在一起，
