@@ -350,7 +350,9 @@ final class Store: ObservableObject {
     /// 点「重启书办」时记下当前页面。重启是新进程，内存里什么都不剩，
     /// 不落一个一次性键，回来就只剩日历页，用户会以为「没重启」。
     func markRelaunch() {
-        UserDefaults.standard.set(mode, forKey: "shuban.reopenMode")
+        let d = UserDefaults.standard
+        d.set(mode, forKey: "shuban.reopenMode")
+        d.set(Date().timeIntervalSince1970, forKey: "shuban.reopenModeAt")
     }
 
     init() {
@@ -362,11 +364,18 @@ final class Store: ObservableObject {
             scope = v
         }
         // 点「重启书办」前记下的页面：一次性键，读完就删，正常退出不会把页面钉死在录屏上。
-        // 重启回来直接落在录屏页 —— 否则回到日历页，用户根本看不出「到底重启成功了没有」。
-        if let m = UserDefaults.standard.object(forKey: "shuban.reopenMode") as? Int {
-            mode = m
-            justRelaunched = true
-            UserDefaults.standard.removeObject(forKey: "shuban.reopenMode")
+        // 只认 90 秒内的记录 —— 万一那次重启没拉起来（键留了下来），
+        // 几天后正常启动就会莫名其妙落到录屏页，用户只会觉得「怎么老自己切过去」。
+        let ud = UserDefaults.standard
+        if let m = ud.object(forKey: "shuban.reopenMode") as? Int {
+            let at = ud.double(forKey: "shuban.reopenModeAt")
+            let fresh = at > 0 && Date().timeIntervalSince1970 - at < 90
+            if fresh {
+                mode = m
+                justRelaunched = true
+            }
+            ud.removeObject(forKey: "shuban.reopenMode")
+            ud.removeObject(forKey: "shuban.reopenModeAt")
         }
         // 验收钩子：WECAL_MODE=1 直接打开录屏面板（离屏拍图用，正常启动不设）
         if let m = ProcessInfo.processInfo.environment["WECAL_MODE"], let v = Int(m) { mode = v }
@@ -1262,6 +1271,10 @@ struct ContentView: View {
         )
         // 回车兜底：输入法组字/未组字两种情况都由 AppDelegate 的按键监视器发信号
         .onChange(of: store.composerSubmitTick) { _ in submitTodo() }
+        // 页面切换留痕：只在「界面自己跳过去」时才需要追因，没有日志就只能靠猜
+        .onChange(of: store.mode) { m in
+            store.logUI("页面 → \(m == 1 ? "录屏" : "日历")")
+        }
         .onAppear(perform: openPanelForTest)
         .alert("删除这条待办？", isPresented: Binding(
             get: { pendingDelete != nil },
@@ -3520,6 +3533,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.contentMinSize = NSSize(width: 1, height: 1)
         p.setFrame(f, display: true, animate: true)
         store.logUI("\(edge.name)收起 → \(Int(f.width))×\(Int(f.height))")
+        // 收起来就算「这次操作结束」：页面退回日历。
+        // 否则鼠标一靠近窄条就展开成上次那张录屏页，看着像「老是自动切到这个画面」。
+        // 正在录 / 倒计时 / 收尾 / 自检时不退，免得把正在看的结果页刷掉。
+        if store.mode == 1 && !recorder.isBusy && !recorder.checking {
+            store.mode = 0
+        }
     }
 
     private func expand() {
