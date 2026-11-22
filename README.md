@@ -156,4 +156,6 @@ data/data.json        本地数据快照（不入库）
 
 [MIT](LICENSE) —— 随便用，商用、改、二次分发都行，保留版权声明即可。
 
+版本之间的变化见 [CHANGELOG.md](CHANGELOG.md)。
+
 个人项目，作者 **zhanggefei@126.com**。如果它对你有用，**点个 ⭐ 就是最好的鼓励**。
