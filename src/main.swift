@@ -1151,6 +1151,15 @@ enum Fnt {
 @inline(__always)
 func S(_ v: CGFloat) -> CGFloat { v * Fnt.scale }
 
+/// 页面名。日志和界面提示都走这一个映射，免得加了第三页之后某处还写着「日历 / 录屏」二元判断
+func modeName(_ m: Int) -> String {
+    switch m {
+    case 1: return "录屏"
+    case 2: return "笔记"
+    default: return "日历"
+    }
+}
+
 // MARK: - 主视图
 
 struct ContentView: View {
@@ -1246,6 +1255,8 @@ struct ContentView: View {
                 peekStrip
             } else if store.mode == 1 {
                 RecordPanel()
+            } else if store.mode == 2 {
+                NotePanel()
             } else {
                 mainStack
             }
@@ -1273,7 +1284,7 @@ struct ContentView: View {
         .onChange(of: store.composerSubmitTick) { _ in submitTodo() }
         // 页面切换留痕：只在「界面自己跳过去」时才需要追因，没有日志就只能靠猜
         .onChange(of: store.mode) { m in
-            store.logUI("页面 → \(m == 1 ? "录屏" : "日历")")
+            store.logUI("页面 → \(modeName(m))")
         }
         .onAppear(perform: openPanelForTest)
         .alert("删除这条待办？", isPresented: Binding(
@@ -2480,12 +2491,32 @@ struct ContentView: View {
                 .foregroundColor(store.footerIsError(store.statusText) ? Theme.sched : Theme.inkSoft)
                 .lineLimit(1)
             Spacer(minLength: 0)
+            noteChip
             recordChip
         }
         .padding(.horizontal, S(16))
         .padding(.vertical, S(7))
         .background(Theme.cream.opacity(0.92))
         .overlay(alignment: .top) { Theme.ribbon.frame(height: S(1)).opacity(0.45) }
+    }
+
+    /// 底栏的记事本入口。和录屏那颗并列，都是书办的子功能页。
+    private var noteChip: some View {
+        Button { store.mode = 2 } label: {
+            HStack(spacing: S(3)) {
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: S(8), weight: .semibold))
+                Text("笔记")
+                    .font(Fnt.s(8.5, .semibold))
+            }
+            .foregroundColor(Theme.goldDeep)
+            .padding(.horizontal, S(6))
+            .padding(.vertical, S(2))
+            .background(Capsule().fill(Theme.todo.opacity(0.16)))
+            .overlay(Capsule().stroke(Theme.todo.opacity(0.45), lineWidth: 0.8))
+        }
+        .buttonStyle(.plain)
+        .help("记事本 · 书办子功能")
     }
 
     /// 底栏右侧的录屏入口。录制中直接变成「计时 + 停止」，
@@ -2638,6 +2669,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let store = Store()
     /// 录屏引擎。整个 app 一份，面板、悬浮条、底栏都读它。
     let recorder = Recorder()
+    /// 记事本数据。同样全 app 一份：面板负责画，落盘与树结构都在它里面。
+    let notes = NoteStore()
     let width: CGFloat = 384
     let height: CGFloat = 520
     /// 可缩放范围（窗口 frame 尺寸），与 Fnt 的 0.8~2.0 缩放档对齐。
@@ -2752,6 +2785,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var hoverFrozen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 验收钩子：记事本数据层的用例表，临时目录里跑，不建窗口
+        if ProcessInfo.processInfo.environment["WECAL_NOTES_TEST"] == "1" {
+            NoteStore.runSelfTest()   // 内部 exit(0/1)，不返回
+            return
+        }
         // 验收钩子 4：只跑贴边判定的用例表，不建窗口、跑完即退
         if ProcessInfo.processInfo.environment["WECAL_PEEK_TEST"] == "4" {
             PeekCase.runAll()
@@ -2766,9 +2804,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recorder.onLog = { [weak self] line in self?.store.logUI(line) }
         recorder.onRelaunch = { [weak self] in self?.store.markRelaunch() }
 
+        // 记事本要先定好目录再建窗口：面板一上屏就会读树，
+        // 配晚了第一帧会显示「还没有笔记」，看着像数据丢了。
+        notes.configure(projectDir: store.projectDir)
+
         let host = BleedHostingView(rootView: ContentView()
             .environmentObject(store)
-            .environmentObject(recorder))
+            .environmentObject(recorder)
+            .environmentObject(notes))
         host.frame = NSRect(x: 0, y: 0, width: width, height: height)
 
         let p = Panel(contentRect: host.frame,
@@ -3132,6 +3175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // （generated_at 停在 00:29:32）。凡是「加了个 start 方法」的，必须在这看到它的调用点。
         store.startAutoSync()
         installReturnMonitor()
+        installPasteMonitor()
         startPeekWatching()
         // 上次退出时窗口本来就贴在边上：重启后不会再收到 windowDidMove，
         // 不主动判一次的话「贴边」这个状态一重启就丢了（要等下次拖窗口才恢复）
@@ -3142,14 +3186,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if self.store.justRelaunched {
                 self.panel?.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
-                self.store.logUI("重启完成：落在第 \(self.store.mode == 1 ? "录屏" : "日历") 页，面板已展开")
+                self.store.logUI("重启完成：落在第 \(modeName(self.store.mode)) 页，面板已展开")
                 return
             }
             self.considerSnap()
         }
+
+        // 验收钩子：真往正文里按一次回车，看它有没有变成换行。
+        // 底栏那个回车监视器是本地监视器，专治「输入法还没上屏」；它一顺手把
+        // 笔记正文的回车也吃掉，正文就永远打不出第二段 —— 这种错光看代码看不出来。
+        if ProcessInfo.processInfo.environment["WECAL_NOTES_ENTER_TEST"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                self?.runNotesEnterTest()
+            }
+        }
     }
 
-    // MARK: 自检轮询
+    /// 找到 TextEditor 背后的 NSTextView，塞一句话，投一个真回车，看结果是不是换行
+    private func runNotesEnterTest() {
+        guard let p = panel else { say("FAIL 没有窗口"); exit(1) }
+        p.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        guard let tv = Self.findTextView(p.contentView) else {
+            say("FAIL 没找到正文背后的 NSTextView（页面在第 \(modeName(store.mode)) 页）")
+            exit(1)
+        }
+        p.makeFirstResponder(tv)
+        tv.string = "第一行"
+        tv.setSelectedRange(NSRange(location: (tv.string as NSString).length, length: 0))
+        say("== 记事本回车用例 ==")
+        var all: [NSTextView] = []
+        Self.collectTextViews(p.contentView, &all)
+        say("  可编辑 NSTextView \(all.count) 个，选中 \(Int(tv.bounds.width))x\(Int(tv.bounds.height))，"
+            + "首响应者=\(p.firstResponder.map { String(describing: type(of: $0)) } ?? "nil")，"
+            + "isKey=\(p.isKeyWindow)")
+        guard let e = NSEvent.keyEvent(with: .keyDown,
+                                       location: .zero,
+                                       modifierFlags: [],
+                                       timestamp: ProcessInfo.processInfo.systemUptime,
+                                       windowNumber: p.windowNumber,
+                                       context: nil,
+                                       characters: "\r",
+                                       charactersIgnoringModifiers: "\r",
+                                       isARepeat: false,
+                                       keyCode: 36) else {
+            say("FAIL 造不出按键事件")
+            exit(1)
+        }
+        NSApp.postEvent(e, atStart: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            let s = tv.string
+            let ok = s.contains("\n")
+            if ok { say("  ✓ 回车在正文里是换行，没被底栏监视器吃掉") }
+            else { say("  ✗ 回车被吃掉了，正文还是 \(s.debugDescription)") }
+            say("== 结果：\(ok ? "1 通过 / 0 失败" : "0 通过 / 1 失败") ==")
+            exit(ok ? 0 : 1)
+        }
+    }
+
+    static func findTextView(_ v: NSView?) -> NSTextView? {
+        var hits: [NSTextView] = []
+        collectTextViews(v, &hits)
+        // 窗口里可能同时有「搜索框的 field editor」和「正文编辑器」，
+        // 认面积最大的那个 —— 正文永远比单行输入框大
+        return hits.max { a, b in
+            (a.bounds.width * a.bounds.height) < (b.bounds.width * b.bounds.height)
+        }
+    }
+
+    static func collectTextViews(_ v: NSView?, _ out: inout [NSTextView]) {
+        guard let v = v else { return }
+        if let tv = v as? NSTextView, tv.isEditable { out.append(tv) }
+        for s in v.subviews { collectTextViews(s, &out) }
+    }
+
 
     /// 结论一出来就走，别按固定 40 秒死等 —— 自检常态 5 秒左右就完了。
     private func pollCheck(until deadline: Date) {
@@ -3178,6 +3288,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: 回车兜底
 
     private var returnMonitor: Any?
+    /// ⌘V 贴图监视器（只在笔记页生效）
+    private var pasteMonitor: Any?
 
     /// 待办输入框的回车兜底。
     ///
@@ -3190,6 +3302,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func installReturnMonitor() {
         returnMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self, let panel = self.panel, e.window === panel else { return e }
+            // 笔记页的编辑区是 TextEditor，回车就是换行。这里一接管，正文就永远打不出
+            // 第二段 —— 所以整页豁免，交还给编辑器自己处理。
+            guard self.store.mode != 2 else { return e }
             guard e.keyCode == 36 || e.keyCode == 76 else { return e }          // Return / Enter
             guard e.modifierFlags.intersection([.command, .option, .control]).isEmpty else { return e }
             // 只有焦点在文本输入框（field editor 是 NSTextView）时才接管
@@ -3206,12 +3321,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    /// 笔记页的 ⌘V 贴图。
+    /// TextEditor 只会把剪贴板里的文本贴进来，图片它不管 —— 所以在按键层截一道：
+    /// 剪贴板里确实是图就落盘挂到当前笔记上并吞掉事件，是纯文本就原样放行，
+    /// 正文照常粘文字，两种操作不打架。
+    private func installPasteMonitor() {
+        pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self, let panel = self.panel, e.window === panel else { return e }
+            guard self.store.mode == 2 else { return e }
+            let cmd = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard cmd.contains(.command), cmd.intersection([.option, .control]).isEmpty else { return e }
+            guard e.charactersIgnoringModifiers?.lowercased() == "v" else { return e }
+            guard let img = NoteStore.imageFromPasteboard() else { return e }
+            _ = self.notes.addImage(img)
+            return nil
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         saveFrame()
         recorder.shutdownSync()
+        // 笔记的落盘是 0.7 秒防抖的，退出前必须补一刀，否则最后几个字会丢
+        notes.saveNow()
         // 重启/退出时把在跑的刷新掐掉，别留孤儿进程写「成功但空」的结果
         store.cancelRefresh()
         if let m = returnMonitor { NSEvent.removeMonitor(m); returnMonitor = nil }
+        if let m = pasteMonitor { NSEvent.removeMonitor(m); pasteMonitor = nil }
     }
 
     /// 拖拽缩放时的尺寸闸门：contentMinSize 在 fullSizeContentView 下不生效，改为手动夹紧
@@ -3493,12 +3628,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     nonisolated static func peekExpandZone(_ f: NSRect) -> NSRect {
         f.insetBy(dx: -peekHotSlack, dy: -peekHotSlack)
     }
-    /// 有没有附属窗口正在被使用（弹层、确认框、菜单）
+    /// 有没有附属窗口正在被使用（弹层、确认框、菜单、选文件的对话框）
     private var auxiliaryWindowOpen: Bool {
         for w in NSApp.windows where w.isVisible && w !== panel {
             let cls = String(describing: type(of: w))
             if cls.contains("Popover") || cls.contains("Alert")
-                || cls.contains("Sheet") || cls.contains("Menu") { return true }
+                || cls.contains("Sheet") || cls.contains("Menu")
+                // 记事本「贴图」会拉出 NSOpenPanel：鼠标这时压在对话框上，
+                // 不豁免的话面板会在取文件的过程中缩成 14pt 窄条
+                || cls.contains("OpenPanel") || cls.contains("SavePanel") { return true }
         }
         return false
     }

@@ -620,7 +620,10 @@ enum RelativeDate {
         return f
     }()
     static func text(_ d: Date) -> String {
-        if Date().timeIntervalSince(d) < 60 * 60 * 24 {
+        let gap = Date().timeIntervalSince(d)
+        // 刚落盘的东西 RelativeDateTimeFormatter 会说「0秒后」——那是在夸自己手快吗
+        if abs(gap) < 60 { return "刚刚" }
+        if gap < 60 * 60 * 24 {
             return fmt.localizedString(for: d, relativeTo: Date())
         }
         let f = DateFormatter()
