@@ -30,11 +30,20 @@ private func PF(_ size: CGFloat,
     .system(size: (size * panelZoom * 2).rounded() / 2, weight: weight, design: design)
 }
 
+/// 最近录制那一列的节拍器。文件是「盘上的东西」，随时可能在 Finder 里被删掉、
+/// 被微信挪走，光靠 onAppear / 换阶段拉一次是不够的 —— 拉一次之后就一直是旧快照。
+private let recentsTicker = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+
 struct RecordPanel: View {
     @Environment(\.closeFeaturePane) private var closePane
     @EnvironmentObject var rec: Recorder
     /// 最近十来条成片。窗口拉高时它撑满下半区，不再留一大片空白
     @State private var recents: [RecentClip] = []
+    /// 正在问「真要删？」的那一行。删除是不可撤销动作里的头一号，
+    /// 点一下就没了太糙；这里用行内二次确认，不用弹窗（这个窗是非激活面板，弹窗很别扭）
+    @State private var confirmingDelete: String?
+    /// 二次确认的自动收回（切去看别的、忘了点，5 秒后自己复位）
+    @State private var confirmFallback: DispatchWorkItem?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -50,8 +59,33 @@ struct RecordPanel: View {
             // 用户点「去开启」进去也只能对着空列表发呆。
             rec.ensureRegisteredOnce()
             loadRecents()
+            // 只给拍图验收用：WECAL_REC_CONFIRM=1 把第一行摆成「正问要不要删」那个态。
+            // 这个态平时只有鼠标点得出来，不摆出来的话排版没人验过。
+            if ProcessInfo.processInfo.environment["WECAL_REC_CONFIRM"] == "1",
+               let f = recents.first {
+                confirmingDelete = f.id
+            }
         }
         .onChange(of: rec.phase) { _ in loadRecents() }
+        // 盘面对一遍：文件被别处删掉 → 这一行自己消失，别留个点开就报错的僵尸行。
+        // 只在窗口真在屏幕上时才跑：关掉只是 orderOut，视图还活着，
+        // 不挡这一下的话，一条两秒的轮询会在后台一直空转。
+        .onReceive(recentsTicker) { _ in
+            guard paneIsOpen else { return }
+            // 录制中 / 封装中盘上那个文件是 0 字节的临时件，跟着抖没意义
+            switch rec.phase {
+            case .recording, .countdown, .finishing: return
+            default: break
+            }
+            loadRecents()
+        }
+    }
+
+    /// 录屏窗现在是不是摊在屏幕上。窗口在 makePanel 里挂了 identifier（= 存档键），
+    /// 拿它认人 —— 不能用标题，标题是给内部识别用的普通字符串，改起来没约束。
+    private var paneIsOpen: Bool {
+        let id = NSUserInterfaceItemIdentifier(FeaturePane.record.frameKey)
+        return NSApp.windows.contains { $0.identifier == id && $0.isVisible }
     }
 
     // MARK: 头部
@@ -308,48 +342,146 @@ struct RecordPanel: View {
                 ForEach(Array(recents.enumerated()), id: \.element.id) { i, c in
                     if i > 0 { divider }
                     HStack(spacing: PZ(6)) {
-                        Image(systemName: "film")
+                        Image(systemName: c.isShare ? "square.and.arrow.up.on.square" : "film")
                             .font(PF(10, .semibold))
-                            .foregroundColor(Theme.sched.opacity(0.75))
+                            .foregroundColor((c.isShare ? Theme.goldDeep : Theme.sched).opacity(0.75))
                         VStack(alignment: .leading, spacing: 0) {
                             Text(c.name)
                                 .font(PF(9.5, .semibold)).foregroundColor(Theme.ink)
                                 .lineLimit(1).truncationMode(.middle)
-                            Text("\(Media.fmtSize(c.size)) · \(RelativeDate.text(c.date))")
+                                .help(c.url.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                            Text("\(Media.fmtSize(c.size)) · \(RelativeDate.text(c.date))"
+                                 + (c.isShare ? " · 分享版" : ""))
                                 .font(PF(8.5)).foregroundColor(Theme.inkSoft)
                         }
-                        Spacer(minLength: 0)
-                        Button { rec.open(c.url) } label: {
-                            Image(systemName: "play.circle.fill")
-                                .font(PF(13)).foregroundColor(Theme.sched)
+                        Spacer(minLength: PZ(4))
+                        // 问「真要删？」的这一行：两枚小胶囊换掉那三个图标，
+                        // 位置固定，不会把整行挤得跳一下
+                        if confirmingDelete == c.id {
+                            actionChip("移到废纸篓", color: Theme.warn) { remove(c) }
+                            actionChip("算了", color: Theme.inkSoft) { cancelConfirm() }
+                        } else {
+                            iconButton("play.circle.fill", tint: Theme.sched, help: "播放") {
+                                rec.open(c.url)
+                            }
+                            iconButton("magnifyingglass.circle", tint: Theme.inkSoft,
+                                       help: "在 Finder 里显示") { rec.reveal(c.url) }
+                            iconButton("trash", tint: Theme.inkSoft.opacity(0.6), help: "移到废纸篓") {
+                                askRemove(c)
+                            }
                         }
-                        .buttonStyle(.plain)
-                        .help("播放")
-                        Button { rec.reveal(c.url) } label: {
-                            Image(systemName: "magnifyingglass.circle")
-                                .font(PF(13)).foregroundColor(Theme.inkSoft)
-                        }
-                        .buttonStyle(.plain)
-                        .help("在 Finder 里显示")
                     }
                 }
             }
         }
     }
 
-    private func loadRecents() {
-        let fm = FileManager.default
-        guard let items = try? fm.contentsOfDirectory(
-            at: rec.outDir, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]
-        ) else { recents = []; return }
+    private func iconButton(_ icon: String, tint: Color, help: String,
+                            action: @escaping () -> Void) -> some View {
+        Button { action() } label: {
+            Image(systemName: icon)
+                .font(PF(13))
+                .foregroundColor(tint)
+                .frame(width: PZ(15), height: PZ(15))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private func actionChip(_ t: String, color: Color, action: @escaping () -> Void) -> some View {
+        Button { action() } label: {
+            Text(t)
+                .font(PF(8.5, .bold))
+                .foregroundColor(color)
+                .padding(.horizontal, PZ(6)).padding(.vertical, PZ(2.5))
+                .background(Capsule().fill(color.opacity(0.12)))
+                .overlay(Capsule().stroke(color.opacity(0.4), lineWidth: 0.7))
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: 删一条成片
+
+    /// 先问一句。删除没有撤销键，误点一下原片就进废纸篓了 ——
+    /// 虽然废纸篓能捞回来，但多数人不会想到去翻。
+    private func askRemove(_ c: RecentClip) {
+        confirmingDelete = c.id
+        confirmFallback?.cancel()
+        let w = DispatchWorkItem { if confirmingDelete == c.id { confirmingDelete = nil } }
+        confirmFallback = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: w)
+    }
+
+    private func cancelConfirm() {
+        confirmFallback?.cancel()
+        confirmingDelete = nil
+    }
+
+    private func remove(_ c: RecentClip) {
+        cancelConfirm()
+        // 「xxx_分享版.mp4」是同一条录制压出来的子件。删原片时一起收走，
+        // 不然列表里会留个孤儿分享版，谁也认不出它从哪来。
+        let targets = [c.url] + Self.shareCompanions(of: c.url)
+        var failed: String?
+        for u in targets where FileManager.default.fileExists(atPath: u.path) {
+            do {
+                try FileManager.default.trashItem(at: u, resultingItemURL: nil)
+            } catch {
+                failed = u.lastPathComponent + "：" + error.localizedDescription
+            }
+        }
+        // 删掉的正好是「录制完成」那张卡在说的那条 → 那张卡也就没话可说了
+        if let last = rec.lastResultPath,
+           last.standardizedFileURL.path == c.url.standardizedFileURL.path {
+            rec.reset()
+        }
+        loadRecents()
+        if let msg = failed {
+            rec.statusLine = "有文件没删掉（\(msg)）"
+        } else if recents.isEmpty {
+            rec.statusLine = "已移入废纸篓，录屏文件夹现在空了"
+        } else {
+            rec.statusLine = "已移入废纸篓：\(c.name)"
+        }
+        rec.onLog?("删除成片 \(c.name)")
+    }
+
+    /// 一条录制名下的分享版（`原片名_分享版.mp4`）。传进来的自己就是分享版时返回空 ——
+    /// 删分享版不该顺手把原片也带走。
+    static func shareCompanions(of url: URL) -> [URL] {
+        let base = url.deletingPathExtension()
+        guard !base.lastPathComponent.hasSuffix("_分享版") else { return [] }
+        let share = base.deletingLastPathComponent()
+            .appendingPathComponent(base.lastPathComponent + "_分享版.mp4")
+        return FileManager.default.fileExists(atPath: share.path) ? [share] : []
+    }
+
+    /// 扫一个目录里最新的成片。抽成静态的，是为了让验收能脱离窗口直接验它 ——
+    /// 「文件被删了要不要消失」这种逻辑光看界面看不出来。
+    static func scan(_ dir: URL, limit: Int = 12) -> [RecentClip] {
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]
+        ) else { return [] }
         let list: [RecentClip] = items.compactMap { u in
             guard u.pathExtension.lowercased() == "mp4" else { return nil }
             let v = try? u.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
             guard let d = v?.contentModificationDate else { return nil }
             return RecentClip(url: u, size: v?.fileSize ?? 0, date: d)
         }
-        recents = Array(list.sorted { $0.date > $1.date }.prefix(12))
+        return Array(list.sorted { $0.date > $1.date }.prefix(limit))
     }
+
+    private func loadRecents() {
+        recents = Self.scan(rec.outDir)
+        RecordPanel.debugRecents = recents
+    }
+
+    /// 测试接缝：界面此刻拿的是哪几条成片。
+    /// 「文件被别处删掉 → 这一行自己消失」这条链子，光验 scan 是假通过 ——
+    /// scan 是纯函数，本来就对；真会坏的是轮询没跑、或者窗口认错了人根本没刷。
+    /// 所以要有一处能回答「屏幕上现在列着什么」。
+    static var debugRecents: [RecentClip] = []
 
     // MARK: 倒计时 / 录制中 / 收尾
 
@@ -651,6 +783,8 @@ struct RecentClip: Identifiable {
     let date: Date
     var id: String { url.path }
     var name: String { url.lastPathComponent }
+    /// 「xxx_分享版.mp4」是同一条录制压出来的分享子件，界面上要跟原片区分开
+    var isShare: Bool { url.deletingPathExtension().lastPathComponent.hasSuffix("_分享版") }
 }
 
 /// 「3 分钟前 / 昨天 / 11月20日」——比裸时间戳更像人话

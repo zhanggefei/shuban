@@ -326,6 +326,11 @@ final class Recorder: ObservableObject {
     var onLog: ((String) -> Void)?
 
     let outDir: URL = {
+        // 验收钩子：WECAL_REC_DIR 换成片目录。自动刷新那条用例要往目录里造/删假成片，
+        // 不换走的话就会拿用户真的录屏文件夹当试验田。
+        if let d = ProcessInfo.processInfo.environment["WECAL_REC_DIR"], !d.isEmpty {
+            return URL(fileURLWithPath: (d as NSString).expandingTildeInPath, isDirectory: true)
+        }
         let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Movies")
         return movies.appendingPathComponent("屏幕录制")
