@@ -2593,6 +2593,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard f.width > 120, f.height > 120 else { continue }
             // 恢复时也走一遍屏幕夹紧：老存档可能是「比可见区还高」的尺寸
             f = Self.fitToScreen(f, vf)
+            // 上下限也夹一道：上下限是会变的（比如录屏窗从 420 宽改成 620），
+            // 老存档一旦小于新下限，窗口就会以一个不该存在的尺寸出现
+            if let lim = VisibleArea.shared.limits[ObjectIdentifier(p)] {
+                let w = min(max(f.width, lim.min.width), lim.max.width)
+                let h = min(max(f.height, lim.min.height), lim.max.height)
+                if w != f.width { f.origin.x = min(f.origin.x, vf.maxX - w) }
+                if h != f.height { f.origin.y = max(f.origin.y, vf.minY) }
+                f.size = NSSize(width: w, height: h)
+            }
             p.setFrame(f, display: false)
             return
         }
@@ -2694,17 +2703,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                           size: size,
                           min: f.minSize,
                           max: f.maxSize) {
-            Group {
-                if f == .record {
-                    RecordPanel()
-                } else {
-                    NotePanel()
+            // 外面这层 FeatureShell 负责铺满不透明的底 —— 窗口是透明的，
+            // 少了它卡片之间的缝就直通桌面（2026-11-23 修）
+            FeatureShell {
+                Group {
+                    if f == .record {
+                        RecordPanel()
+                    } else {
+                        NotePanel()
+                    }
                 }
+                .environmentObject(store)
+                .environmentObject(recorder)
+                .environmentObject(notes)
+                .environment(\.closeFeaturePane, { [weak self] in self?.closeFeature(f) })
             }
-            .environmentObject(store)
-            .environmentObject(recorder)
-            .environmentObject(notes)
-            .environment(\.closeFeaturePane, { [weak self] in self?.closeFeature(f) })
         }
         // 第一次打开摆在主面板右边；摆不下就左边，再不行居中。之后按存档恢复
         restoreFrame(p, key: f.frameKey, fallback: size, near: panel?.frame)
@@ -3157,8 +3170,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             check(abs(store.zoom - beforeZoom) < 0.008, "改子窗尺寸不改主面板字号档（\(beforeZoom)）")
         }
 
+        // 6) 底色必须是不透的。窗口是透明的（圆角外面要能透），
+        //    SwiftUI 少铺一层底，卡片之间的缝就直通桌面 —— 2026-11-23 就出过这问题：
+        //    录屏窗 33.6%、记事本窗 98.1% 的像素是透明的，光看代码看不出来。
+        for f in FeaturePane.allCases {
+            guard let p = featurePanel(f) else { continue }
+            let r = Self.translucentRatio(p)
+            check(r < 0.02, "\(f.title)窗底色不透桌面（半透明像素 \(String(format: "%.2f", r * 100))%）")
+        }
+
         say("== 结果：\(pass) 通过 / \(fail) 失败 ==")
         exit(fail == 0 ? 0 : 1)
+    }
+
+    /// 窗口截图里半透明像素的占比。窗口本身是 .clear 的，只有 SwiftUI 画到的地方才有底色，
+    /// 所以这个数就是「有多少面积在透桌面」。圆角那一圈抗锯齿约 0.1%，阈值定 2%。
+    static func translucentRatio(_ w: NSWindow) -> Double {
+        guard let cv = w.contentView, cv.bounds.width > 10, cv.bounds.height > 10,
+              let rep = cv.bitmapImageRepForCachingDisplay(in: cv.bounds) else { return 1 }
+        cv.cacheDisplay(in: cv.bounds, to: rep)
+        guard let img = rep.cgImage else { return 1 }
+        let px = img.width, py = img.height
+        var buf = [UInt8](repeating: 0, count: px * py * 4)
+        guard let ctx = CGContext(data: &buf, width: px, height: py, bitsPerComponent: 8,
+                                  bytesPerRow: px * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return 1 }
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: px, height: py))
+        var translucent = 0
+        for i in stride(from: 3, to: buf.count, by: 4) where buf[i] < 250 { translucent += 1 }
+        return Double(translucent) / Double(px * py)
     }
 
     /// 找到 TextEditor 背后的 NSTextView，塞一句话，投一个真回车，看结果是不是换行

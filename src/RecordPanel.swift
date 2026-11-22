@@ -14,10 +14,10 @@ import AppKit
 
 // MARK: - 这一页自己的字号与尺寸档
 
-/// 录屏窗口是独立窗口，尺寸自己定（默认 420×640），所以不再跟随主面板的全局缩放档
+/// 录屏窗口是独立窗口，尺寸自己定（默认 620×690），所以不再跟随主面板的全局缩放档
 /// —— 那个档位是主面板宽度的函数，两个窗口各拖各的会互相抢。
 /// 这里给录屏窗钉一个固定档，窗口拉大时只是留白变多，字号不动。
-private let panelZoom: CGFloat = 1.05
+private let panelZoom: CGFloat = 1.15
 
 /// 长度：把基准版的固定尺寸换算到本窗口的档位
 @inline(__always)
@@ -33,22 +33,16 @@ private func PF(_ size: CGFloat,
 struct RecordPanel: View {
     @Environment(\.closeFeaturePane) private var closePane
     @EnvironmentObject var rec: Recorder
-    /// 最近三条成片。面板高的时候下面本来是一片空白，拿它填上既有用又不打乱布局
+    /// 最近十来条成片。窗口拉高时它撑满下半区，不再留一大片空白
     @State private var recents: [RecentClip] = []
 
     var body: some View {
         VStack(spacing: 0) {
             header
             ribbonDivider
-            ScrollView(showsIndicators: false) {
-                VStack(spacing: PZ(9)) {
-                    content
-                }
-                .padding(.horizontal, PZ(13))
-                .padding(.top, PZ(10))
-                .padding(.bottom, PZ(14))
-            }
-            footer
+            stage
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            actionBar
         }
         .onAppear {
             rec.refreshPermission()
@@ -136,8 +130,10 @@ struct RecordPanel: View {
 
     // MARK: 主体按阶段切换
 
+    /// 倒计时 / 录制中 / 收尾 都是「正在发生」，占满中间整块；
+    /// 其余回设置态 —— 设置态是宽窗口里的两栏，才像个桌面工具。
     @ViewBuilder
-    private var content: some View {
+    private var stage: some View {
         switch rec.phase {
         case .countdown(let n): countdownStage(n)
         case .recording:       recordingStage
@@ -148,17 +144,41 @@ struct RecordPanel: View {
 
     // MARK: 设置态
 
-    @ViewBuilder
+    /// 宽窗口：上面横贯的状态卡（权限 / 结果 / 失败 / 自检），
+    /// 中间「录制范围 | 选项」并排，下面最近录制。主按钮在底栏右下角。
     private var setupStage: some View {
-        if !rec.granted { permCard }
-        if case .done(let r) = rec.phase { resultCard(r) }
-        if case .failed(let msg) = rec.phase { failCard(msg) }
-        if !rec.checkLines.isEmpty { checkCard }
-        rangeCard
-        optionCard
-        startButton
-        tailActions
-        if !recents.isEmpty { recentCard }
+        // GeometryReader 是为了「不足一屏也铺满」：ScrollView 里的子视图拿到的是
+        // 理想高度，给它 maxHeight 没用，卡片照样顶在上边、底下留一片空。
+        // 用视口高度当下限，最近录制那张卡才会一直长到底。
+        GeometryReader { geo in
+        ScrollView(showsIndicators: false) {
+            VStack(spacing: PZ(10)) {
+                if !rec.granted { permCard }
+                if case .done(let r) = rec.phase { resultCard(r) }
+                if case .failed(let msg) = rec.phase { failCard(msg) }
+                if !rec.checkLines.isEmpty { checkCard }
+                HStack(alignment: .top, spacing: PZ(10)) {
+                    rangeCard
+                    optionCard
+                }
+                // 这一行只取自己的固有高度（两张卡片互相对齐到较高那张），
+                // 不然 rangeCard 的 maxHeight 会把这个横排也拉成可伸缩的，
+                // 结果上面顶出一大块空白、下面最近录制反而被挤扁
+                .fixedSize(horizontal: false, vertical: true)
+                // 剩下的高度全给最近录制：窗口高一点就多看几条，
+                // 而不是底下空一大块 —— 桌面软件的主列表本来就该跟着窗口长
+                if recents.isEmpty {
+                    Spacer(minLength: 0)
+                } else {
+                    recentCard
+                }
+            }
+            .frame(minHeight: max(0, geo.size.height - PZ(25)), alignment: .top)
+            .padding(.horizontal, PZ(14))
+            .padding(.top, PZ(11))
+            .padding(.bottom, PZ(14))
+        }
+        }
     }
 
     private var permCard: some View {
@@ -186,7 +206,7 @@ struct RecordPanel: View {
     }
 
     private var rangeCard: some View {
-        card {
+        card(stretch: true) {
             VStack(alignment: .leading, spacing: PZ(7)) {
                 sectionLabel("录制范围", right: rec.targetText)
                 HStack(spacing: PZ(5)) {
@@ -269,6 +289,9 @@ struct RecordPanel: View {
                             miniChip(n == 0 ? "关" : "\(n) 秒", on: rec.countdown == n) { rec.countdown = n }
                         }
                     }
+                    // 窗口缩到最小的时候，别让这三个胶囊被挤成两行「3 / 秒」——
+                    // 宁可左边那行说明文字被截断（它有 lineLimit(1) 兜着）
+                    .fixedSize()
                 }
                 divider
                 optionRow("folder", "录完打开 Finder", "顺手把文件挑出来，方便发人") {
@@ -278,36 +301,8 @@ struct RecordPanel: View {
         }
     }
 
-    private var startButton: some View {
-        Button { rec.start() } label: {
-            HStack(spacing: PZ(6)) {
-                Image(systemName: "largecircle.fill.circle")
-                    .font(PF(14, .semibold))
-                Text("开始录制").font(PF(13.5, .bold))
-            }
-            .foregroundColor(.white)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, PZ(11))
-            .background(RoundedRectangle(cornerRadius: PZ(12), style: .continuous).fill(Theme.redGradient))
-            .overlay(RoundedRectangle(cornerRadius: PZ(12), style: .continuous)
-                .stroke(Theme.todo.opacity(0.55), lineWidth: 1))
-            .shadow(color: Theme.redDeep.opacity(0.35), radius: PZ(7), y: PZ(2))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var tailActions: some View {
-        HStack(spacing: PZ(6)) {
-            ghostButton(rec.checking ? "检查中…" : "检查权限与设备",
-                        icon: "checklist") { rec.selfCheck() }
-                .disabled(rec.checking)
-            ghostButton("录制文件夹", icon: "folder") { rec.openFolder() }
-            Spacer(minLength: 0)
-        }
-    }
-
     private var recentCard: some View {
-        card {
+        card(stretch: true) {
             VStack(alignment: .leading, spacing: PZ(6)) {
                 sectionLabel("最近录制", right: "\(recents.count) 条")
                 ForEach(Array(recents.enumerated()), id: \.element.id) { i, c in
@@ -353,7 +348,7 @@ struct RecordPanel: View {
             guard let d = v?.contentModificationDate else { return nil }
             return RecentClip(url: u, size: v?.fileSize ?? 0, date: d)
         }
-        recents = Array(list.sorted { $0.date > $1.date }.prefix(3))
+        recents = Array(list.sorted { $0.date > $1.date }.prefix(12))
     }
 
     // MARK: 倒计时 / 录制中 / 收尾
@@ -370,10 +365,10 @@ struct RecordPanel: View {
             }
             Text("准备开始 · \(rec.range.label) \(rec.targetText)")
                 .font(PF(10)).foregroundColor(Theme.inkSoft)
-            ghostButton("取消", icon: "xmark") { rec.cancelCountdown() }
+            Text("把要讲的窗口摆好，倒计时结束就开始录")
+                .font(PF(8.5)).foregroundColor(Theme.inkSoft.opacity(0.8))
         }
-        .frame(maxWidth: .infinity)
-        .padding(.top, PZ(30))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var recordingStage: some View {
@@ -398,39 +393,25 @@ struct RecordPanel: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            Button { rec.stop() } label: {
-                HStack(spacing: PZ(6)) {
-                    Image(systemName: "stop.fill").font(PF(12, .bold))
-                    Text("停止并保存").font(PF(13.5, .bold))
-                }
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, PZ(11))
-                .background(RoundedRectangle(cornerRadius: PZ(12), style: .continuous)
-                    .fill(LinearGradient(colors: [Theme.redDeep, Theme.warn],
-                                         startPoint: .top, endPoint: .bottom)))
-                .overlay(RoundedRectangle(cornerRadius: PZ(12), style: .continuous)
-                    .stroke(Theme.todo.opacity(0.45), lineWidth: 1))
-            }
-            .buttonStyle(.plain)
             Text("也可以点屏幕上方悬浮条里的「停止」；书办自己和悬浮条都不参与屏幕采集，成片里不会出现")
                 .font(PF(8.5)).foregroundColor(Theme.inkSoft)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.top, PZ(6))
+        // 宽窗口里别把计时卡拉成通栏，收在 420pt 上下更像个计时器
+        .frame(maxWidth: PZ(420), maxHeight: .infinity)
+        .padding(.horizontal, PZ(14))
     }
 
     private var finishingStage: some View {
         VStack(spacing: PZ(10)) {
             ProgressView().progressViewStyle(.circular).controlSize(.large).tint(Theme.sched)
-                .padding(.top, PZ(24))
             Text(rec.statusLine.isEmpty ? "正在封装写入文件…" : rec.statusLine)
                 .font(PF(11, .semibold)).foregroundColor(Theme.ink)
             Text("刚结束，正在算时长、体检画面和声音")
                 .font(PF(9)).foregroundColor(Theme.inkSoft)
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: 结果 / 失败 / 自检
@@ -521,37 +502,79 @@ struct RecordPanel: View {
         }
     }
 
-    // MARK: 底部
+    // MARK: 底栏
 
-    private var footer: some View {
-        HStack(spacing: 5) {
+    /// 底栏 = 左边状态、右边主操作。桌面软件的惯例是主按钮沉在右下角，
+    /// 而且在录制 / 倒计时 / 封装这三种进行态里，同一条栏给出的动作正好是此刻唯一该做的那个。
+    private var actionBar: some View {
+        HStack(spacing: PZ(7)) {
             Circle()
                 .fill(rec.isRecording ? Theme.sched : (rec.granted ? Theme.ok : Theme.todo))
                 .frame(width: PZ(5), height: PZ(5))
             Text(rec.statusLine.isEmpty ? "成片默认存到 ~/Movies/屏幕录制" : rec.statusLine)
                 .font(PF(9.5)).foregroundColor(Theme.inkSoft).lineLimit(1)
-            Spacer(minLength: 0)
-            Button { closePane() } label: {
-                Text("关闭").font(PF(8.5, .semibold)).foregroundColor(Theme.sched)
-                    .padding(.horizontal, PZ(6)).padding(.vertical, PZ(2))
-                    .background(Capsule().fill(Theme.sched.opacity(0.10)))
-            }
-            .buttonStyle(.plain)
+            Spacer(minLength: PZ(8))
+            actionBarButtons
         }
         .padding(.horizontal, PZ(16))
-        .padding(.vertical, PZ(7))
+        .padding(.vertical, PZ(8))
         .background(Theme.cream.opacity(0.92))
         .overlay(alignment: .top) { Theme.ribbon.frame(height: PZ(1)).opacity(0.45) }
     }
 
+    @ViewBuilder
+    private var actionBarButtons: some View {
+        switch rec.phase {
+        case .recording:
+            primaryButton("停止并保存", icon: "stop.fill", fill: stopGradient) { rec.stop() }
+        case .countdown:
+            ghostButton("取消倒计时", icon: "xmark") { rec.cancelCountdown() }
+        case .finishing:
+            HStack(spacing: PZ(5)) {
+                ProgressView().controlSize(.small).tint(Theme.sched)
+                Text("正在封装…").font(PF(9.5, .semibold)).foregroundColor(Theme.inkSoft)
+            }
+        default:
+            ghostButton(rec.checking ? "检查中…" : "检查设备", icon: "checklist") { rec.selfCheck() }
+                .disabled(rec.checking)
+            ghostButton("录制文件夹", icon: "folder") { rec.openFolder() }
+            primaryButton("开始录制", icon: "largecircle.fill.circle") { rec.start() }
+        }
+    }
+
+    private var stopGradient: LinearGradient {
+        LinearGradient(colors: [Theme.redDeep, Theme.warn], startPoint: .top, endPoint: .bottom)
+    }
+
+    private func primaryButton(_ t: String, icon: String,
+                               fill: LinearGradient = Theme.redGradient,
+                               action: @escaping () -> Void) -> some View {
+        Button { action() } label: {
+            HStack(spacing: PZ(4)) {
+                Image(systemName: icon).font(PF(10.5, .semibold))
+                Text(t).font(PF(11.5, .bold))
+            }
+            .foregroundColor(.white)
+            .padding(.horizontal, PZ(14)).padding(.vertical, PZ(6))
+            .background(RoundedRectangle(cornerRadius: PZ(9), style: .continuous).fill(fill))
+            .overlay(RoundedRectangle(cornerRadius: PZ(9), style: .continuous)
+                .stroke(Theme.todo.opacity(0.55), lineWidth: 0.9))
+            .shadow(color: Theme.redDeep.opacity(0.3), radius: PZ(4), y: PZ(1.5))
+        }
+        .buttonStyle(.plain)
+    }
+
     // MARK: 通用件
 
+    /// stretch = 让卡片撑满可用高度。背景是画在 frame 之后的，
+    /// 所以只在外层加 maxHeight 没用 —— 卡片只会顶在上边，底下照样是空的。
     private func card<Content: View>(tint: Color = Theme.cream,
                                     border: Color = Theme.sched.opacity(0.13),
+                                    stretch: Bool = false,
                                     @ViewBuilder _ content: () -> Content) -> some View {
         content()
             .padding(.horizontal, PZ(11)).padding(.vertical, PZ(9))
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: stretch ? .infinity : nil, alignment: .topLeading)
             .background(RoundedRectangle(cornerRadius: PZ(12), style: .continuous).fill(tint))
             .overlay(RoundedRectangle(cornerRadius: PZ(12), style: .continuous)
                 .stroke(border, lineWidth: 0.9))
