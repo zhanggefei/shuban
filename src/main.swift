@@ -2510,6 +2510,16 @@ final class Panel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// 听录用例每一步的答复：还没到点 / 成了 / 不成。
+///
+/// 「还没到点」和「条件不满足」必须分开。混成一个 Bool 的话，「真坏了」和「慢一点」
+/// 长得一模一样，用例只能靠超时假失败 —— 那种红没人看得懂是哪儿坏了。
+enum ListenStep {
+    case wait
+    case ok(String)
+    case bad(String)
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var panel: Panel!
@@ -2518,6 +2528,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let recorder = Recorder()
     /// 记事本数据。同样全 app 一份：面板负责画，落盘与树结构都在它里面。
     let notes = NoteStore()
+    /// 听录引擎。也全 app 一份，而且**故意不跟着窗口走** ——
+    /// 关掉听录窗声音要继续放（边听录音边干活才是这个功能的用法），
+    /// 所以它不能是 AudioPanel 的 @StateObject，只能挂在这里。
+    let audio = AudioBoard()
     let width: CGFloat = 384
     let height: CGFloat = 520
     /// 可缩放范围（窗口 frame 尺寸），与 Fnt 的 0.8~2.0 缩放档对齐。
@@ -2702,7 +2716,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return p
         }
         let size = f.defaultSize
-        let p = makePanel(title: f == .record ? "record" : "notes",
+        let p = makePanel(title: f.panelName,
                           frameKey: f.frameKey,
                           size: size,
                           min: f.minSize,
@@ -2710,16 +2724,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // 外面这层 FeatureShell 负责铺满不透明的底 —— 窗口是透明的，
             // 少了它卡片之间的缝就直通桌面（2026-11-23 修）
             FeatureShell {
+                // 三个子功能各一扇窗，按 FeaturePane 分发。
+                // ⚠️ 别再写成 `if f == .record { … } else { … }` 那种两分支：
+                // 加第三种子功能时它会静默把新窗当成第二种画（菜单同理，见 action(for:)）
                 Group {
-                    if f == .record {
-                        RecordPanel()
-                    } else {
-                        NotePanel()
+                    switch f {
+                    case .record: RecordPanel()
+                    case .notes:  NotePanel()
+                    case .audio:  AudioPanel()
                     }
                 }
                 .environmentObject(store)
                 .environmentObject(recorder)
                 .environmentObject(notes)
+                .environmentObject(audio)
                 .environment(\.closeFeaturePane, { [weak self] in self?.closeFeature(f) })
             }
         }
@@ -2740,9 +2758,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let p = featurePanels[f.rawValue] else { return }
         // 笔记的正文是 0.5 秒防抖落盘的，窗一藏 onDisappear 不一定来，这里补一刀
         if f == .notes { notes.saveNow() }
+        // 听录**故意不在这里停**：关窗继续放才是这个功能的用法（边听录音边干活）。
+        // 会真的把声音掐掉的只有一处 —— 开始录屏，因为外放会被麦克风收进成片。
         saveFrame(p)
         p.orderOut(nil)
-        store.logUI("关闭\(f.title)窗口")
+        let tail = (f == .audio && audio.state.isBusy) ? "（播放继续）" : ""
+        store.logUI("关闭\(f.title)窗口\(tail)")
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -2768,6 +2789,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 记事本要先定好目录再建窗口：面板一上屏就会读树，
         // 配晚了第一帧会显示「还没有笔记」，看着像数据丢了。
         notes.configure(projectDir: store.projectDir)
+        // 听录同理：上屏就要看到上次的曲目列表（而且读列表时顺手就把不存在的文件剔掉了）
+        audio.configure(projectDir: store.projectDir)
+        audio.onLog = { [weak self] line in self?.store.logUI(line) }
 
         let p = makePanel(title: "main", frameKey: Self.frameKey,
                           size: NSSize(width: width, height: height),
@@ -2813,6 +2837,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self else { return }
             self.panel?.sharingType = active ? .none : .readOnly
             for w in self.featurePanels.values { w.sharingType = active ? .none : .readOnly }
+            // 录屏带麦克风时外放会被收进成片，所以这是唯一一处「主动替用户按下暂停」
+            // 的地方。录完不自动续播 —— 接不接下去听由人决定，机器别擅自出声。
+            if active, self.audio.state == .playing {
+                self.audio.toggle()
+                self.store.logUI("开始录屏 → 听录自动暂停（外放会被麦克风收进成片）")
+            }
         }
         // 出成片了把面板叫回前台，别让用户对着桌面找文件
         recorder.onPresentResult = { [weak self] in
@@ -3109,6 +3139,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.runFeatureTest()
             }
         }
+
+        // 验收钩子：听录。纯函数 + 端到端（现场造一个真 .wma 走完整条链子）。
+        if ProcessInfo.processInfo.environment["WECAL_AUDIO_TEST"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                self?.runAudioTest()
+            }
+        }
     }
 
     /// 「最近录制」的自动刷新验收。成片目录必须用 WECAL_REC_DIR 换到临时目录，
@@ -3194,15 +3231,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             say(ok ? "  ✓ \(label)" : "  ✗ \(label)")
             if ok { pass += 1 } else { fail += 1 }
         }
-        func sel(_ f: FeaturePane) -> Selector { f == .record ? #selector(showRecord) : #selector(showNotes) }
+        // 认动作必须走 action(for:)：这张表本身也是被测对象之一，
+        // 用例里再抄一份二元判断的话，菜单挂错了用例还会是绿的
+        func sel(_ f: FeaturePane) -> Selector { action(for: f) }
         say("== 子功能窗口用例 ==")
 
-        // 1) 主菜单的键位：⌘1 日历 / ⌘2 录屏 / ⌘3 记事本
+        // 1) 主菜单的键位：⌘1 日历 / ⌘2 录屏 / ⌘3 记事本 / ⌘4 听录
         let appSub = NSApp.mainMenu?.items.first?.submenu
         let wanted: [(String, Selector, String)] = [
             ("1", #selector(showCalendar), "日历"),
             ("2", #selector(showRecord), "录屏"),
             ("3", #selector(showNotes), "记事本"),
+            ("4", #selector(showAudio), "听录"),
         ]
         for (key, want, name) in wanted {
             let it = appSub?.items.first { $0.keyEquivalent == key }
@@ -3323,6 +3363,367 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         say("== 结果：\(pass) 通过 / \(fail) 失败 ==")
         exit(fail == 0 ? 0 : 1)
+    }
+
+    // MARK: 听录用例
+
+    /// 听录的验收，两半：
+    ///
+    /// ① **纯函数**：ffmpeg 信息块的解析、缓存命名与 LRU、拖放数据解码。
+    ///    「看着对、其实差一点」最容易藏在这几处 —— 比如 `5.1 channels` 直接 Int() 会变 0，
+    ///    比如 Finder 给的 file-url 数据其实是 NSURL 的 keyed archive 而不是路径串。
+    /// ② **端到端**：现场造一个真 .wma（本机 ffmpeg 带 wmav2 编码器），把
+    ///    「拖进来 → 探测元数据 → 解码成 WAV → AVAudioPlayer 出声 → 位置自己前进」
+    ///    整条链子走一遍。这条链子任何一环断了，界面上都只是「点了没声」，看不出来。
+    ///
+    /// 必须配 `WECAL_AUDIO_DIR` + `WECAL_AUDIO_CACHE`：不许拿人真的曲目列表、
+    /// 真的解码缓存做试验田。端到端那几步要真出声设备 —— 没接耳机/音箱的机器
+    /// 会红在「起播」那一步，那是预期的响动，不是用例写坏了。
+    private func runAudioTest() {
+        var pass = 0, fail = 0
+        func check(_ ok: Bool, _ label: String) {
+            say(ok ? "  ✓ \(label)" : "  ✗ \(label)")
+            if ok { pass += 1 } else { fail += 1 }
+        }
+        func done() {
+            say("== 结果：\(pass) 通过 / \(fail) 失败 ==")
+            exit(fail == 0 ? 0 : 1)
+        }
+        say("== 听录用例 ==")
+        let env = ProcessInfo.processInfo.environment
+        guard env["WECAL_AUDIO_DIR"] != nil, env["WECAL_AUDIO_CACHE"] != nil else {
+            say("  ✗ 必须配 WECAL_AUDIO_DIR=<临时目录> 和 WECAL_AUDIO_CACHE=<临时目录> 跑：")
+            say("    前者存曲目列表、后者放解码出来的 WAV，不换走就是在拿人真的列表做试验")
+            say("== 结果：0 通过 / 1 失败 ==")
+            exit(1)
+        }
+        guard let ff = Media.ffmpeg else {
+            say("  ✗ 本机没有 ffmpeg，听录用例没法跑（WMA 全靠它解码）")
+            say("== 结果：0 通过 / 1 失败 ==")
+            exit(1)
+        }
+        let fm = FileManager.default
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("shuban-audio-src", isDirectory: true)
+        try? fm.removeItem(at: dir)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let cacheSnap = audio.cacheDir
+
+        // ---- ① 纯函数：ffmpeg 信息块解析 ----
+        check(AudioBoard.parseClock("00:03:12.24") == 192.24, "时长串 00:03:12.24 → 192.24 秒")
+        check(AudioBoard.parseClock("不知道在说什么") == 0, "时长串认不出来时报 0，不乱猜一个")
+
+        // 这段是从本机 ffmpeg 8.1.2 真实输出抄下来的（缩进四空格，encoder 那行要排除在标签外）
+        let block = """
+        Input #0, asf, from 'a.wma':
+          Metadata:
+            title           : 书办验收 通话录音
+            artist          : 飞致云
+            album           : 验收样本
+            encoder         : Lavf62.12.102
+          Duration: 00:00:03.00, start: 0.000000, bitrate: 61 kb/s
+          Stream #0:0: Audio: wmav2 (a[1][0][0] / 0x0161), 16000 Hz, mono, fltp, 48 kb/s
+        """
+        let info = AudioBoard.parseInfo(block)
+        check(abs(info.duration - 3.0) < 0.01, "真信息块里抠出时长 3 秒（\(info.duration)）")
+        check(info.title == "书办验收 通话录音" && info.artist == "飞致云" && info.album == "验收样本",
+              "标题/艺术家/专辑都抠到，且 encoder 那行没混进标签")
+        check(info.sampleRate == 16000 && info.channels == 1,
+              "采样率与声道（\(info.sampleRate) Hz / \(info.channels) 声道）—— 决定缓存多大、进度怎么估")
+        check(!info.hasArt, "没有视频流不该被认成「有封面」")
+        let long = AudioBoard.parseInfo(
+            "  Duration: 01:02:03.50, start: 0.000000\n"
+            + "  Stream #0:0: Audio: pcm_s16le, 44100 Hz, stereo, fltp, 1411 kb/s")
+        check(abs(long.duration - 3723.5) < 0.01 && long.sampleRate == 44100 && long.channels == 2,
+              "一小时 + 立体声也对（\(long.duration) 秒 / \(long.channels) 声道）")
+        let surround = AudioBoard.parseInfo("  Stream #0:0: Audio: vorbis, 48000 Hz, 5.1 channels, fltp")
+        check(surround.channels == 6, "「5.1 channels」认成 6 条声道（实际 \(surround.channels)）—— Int(\"5.1\") 是 nil")
+        check(AudioBoard.parseInfo("").duration == 0, "空信息块不崩、时长记 0")
+
+        // 缓存命名 / 白名单
+        let probe = ListenTrack(url: URL(fileURLWithPath: "/tmp/书办 验收 录音_01.WMA"),
+                                size: 1234, mtime: Date(timeIntervalSince1970: 1_760_000_000),
+                                dur: 3, title: nil, artist: nil, album: nil, hasArt: false)
+        check(AudioBoard.isPlayable(probe.url)
+                && AudioBoard.isPlayable(URL(fileURLWithPath: "/x/y.MP3"))
+                && !AudioBoard.isPlayable(URL(fileURLWithPath: "/x/会议纪要.txt")),
+              "后缀白名单：WMA / MP3 认，txt 不认（大小写不算）")
+        let cname = AudioBoard.cacheName(probe)
+        check(!cname.contains("/") && cname.hasSuffix(".wav") && cname.count < 90,
+              "缓存名里没有斜杠、长度收敛（\(cname)）—— 否则能拼出跑到别人目录去的文件名")
+        check(AudioBoard.cacheName(probe) == cname, "同一条录音缓存名稳定 → 第二次点播秒开")
+        var resized = probe
+        resized.size = 999
+        check(AudioBoard.cacheName(resized) != cname, "同名文件被改过 → 缓存名跟着变，不错拿旧解码")
+
+        // LRU：造 6 个带先后 mtime 的缓存文件
+        let cacheFarm = dir.appendingPathComponent("cache", isDirectory: true)
+        try? fm.createDirectory(at: cacheFarm, withIntermediateDirectories: true)
+        var wavs: [URL] = []
+        for i in 0..<6 {
+            let u = cacheFarm.appendingPathComponent("c\(i).wav")
+            fm.createFile(atPath: u.path, contents: Data([9]))
+            try? fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000 + Double(i) * 60)],
+                                  ofItemAtPath: u.path)
+            wavs.append(u)
+        }
+        let pruned = AudioBoard.prunePlan(wavs, keep: AudioBoard.cacheKeep)
+        check(pruned.count == 1 && pruned.first?.lastPathComponent == "c0.wav",
+              "缓存超过 \(AudioBoard.cacheKeep) 条只清最旧那条（\(pruned.first?.lastPathComponent ?? "—")）")
+        check(AudioBoard.prunePlan(Array(wavs.prefix(3)), keep: AudioBoard.cacheKeep).isEmpty,
+              "没超上限就不该删任何东西")
+
+        // ---- ② 端到端：真 .wma 走完整条链子 ----
+        let wmaA = dir.appendingPathComponent("书办验收 通话录音_01.wma")
+        let wmaB = dir.appendingPathComponent("无标签第二条.wma")
+        let notAudio = dir.appendingPathComponent("会议纪要.txt")
+        let wmaBad = dir.appendingPathComponent("坏文件.wma")
+        func makeWma(_ to: URL, secs: Int, tagged: Bool) -> Bool {
+            var args = ["-v", "error", "-y", "-f", "lavfi",
+                        "-i", "sine=frequency=440:duration=\(secs)",
+                        "-ac", "1", "-ar", "16000", "-c:a", "wmav2", "-b:a", "48k"]
+            if tagged {
+                args += ["-metadata", "title=书办验收 通话录音", "-metadata", "artist=飞致云",
+                         "-metadata", "album=验收样本"]
+            }
+            args += [to.path]
+            let (rc, out) = Media.run(ff, args, timeout: 30)
+            if rc != 0 { say("    (造样本失败 rc=\(rc)：\(out.prefix(200)))") }
+            return rc == 0 && Media.bytes(of: to) > 1024
+        }
+        let madeA = makeWma(wmaA, secs: 3, tagged: true)
+        let madeB = makeWma(wmaB, secs: 2, tagged: false)
+        fm.createFile(atPath: notAudio.path, contents: "一段文字，不是音频".data(using: .utf8))
+        check(madeA && madeB, "现场造出两条真 .wma（wmav2 · 16 kHz · 单声道）")
+        guard madeA && madeB else {
+            say("== 结果：\(pass) 通过 / \(fail) 失败 ==")
+            exit(1)
+        }
+
+        // 拖放那条路：Finder 给的 public.file-url 数据是 NSURL 的 keyed archive
+        if let arch = try? NSKeyedArchiver.archivedData(withRootObject: wmaA as NSURL,
+                                                        requiringSecureCoding: true) {
+            check(AudioPanel.url(from: arch)?.path == wmaA.path,
+                  "Finder 那种 keyed archive 形式的 file-url 数据解得开（不是当字符串硬解）")
+        } else {
+            check(false, "归档造不出来，无法验拖放数据解码")
+        }
+        check(AudioPanel.url(from: "/tmp/书办 录音.wma" as NSString)?.path == "/tmp/书办 录音.wma",
+              "纯路径串那种形状也认")
+        check(AudioPanel.url(from: Data("这玩意儿不是路径".utf8)) == nil,
+              "认不出来的数据返回 nil，不硬凑一个 URL 出来")
+
+        // 曲目列表存档换到临时目录后再动列表
+        audio.clearList()
+
+        var posAtStart = 0.0
+        var posAtClose = 0.0
+        var tStart = Date()
+        var tClosed = Date()
+        var deletedOutside = false
+        var dropped: [URL]? = nil
+        var rowsAtClose: [String] = []
+
+        // 播放器那条链子每一步都得等（解码、进度、轮询），一路嵌套 asyncAfter 会写成圣诞树。
+        // 所以摆成步骤表：每步「先做一次动作，再反复问够不够」，等不到就按超时算失败。
+        typealias Step = (label: String, budget: Double, start: () -> Void, body: () -> ListenStep)
+        var steps: [Step] = []
+
+        steps.append(("拖进来的文件都进列表 · 不支持的那个不算", 8, {
+            self.audio.add([wmaA, wmaB, notAudio])
+        }, {
+            guard self.audio.tracks.count == 2 else {
+                return .bad("变成 \(self.audio.tracks.count) 条了")
+            }
+            if self.audio.tracks.contains(where: { $0.ext == "txt" }) { return .bad("txt 混进来了") }
+            return .ok("两条 · 会议纪要.txt 被挡在门外")
+        }))
+
+        steps.append(("两条的时长与标签都探到了（无标签的显示文件名）", 25, {}, {
+            guard let a = self.audio.tracks.first(where: { $0.url.path == wmaA.path }), a.dur > 0,
+                  let b = self.audio.tracks.first(where: { $0.url.path == wmaB.path }), b.dur > 0 else {
+                return .wait
+            }
+            if a.title != "书办验收 通话录音" { return .bad("标签没拿到（title=\(a.title ?? "nil")）") }
+            if b.name != "无标签第二条" { return .bad("没标签时该显示文件名，现在显示「\(b.name)」") }
+            if abs(a.dur - 3) > 0.3 { return .bad("时长该是 3 秒，探到 \(a.dur)") }
+            return .ok("A \(Media.fmtDuration(a.dur))「\(a.name)」 / B \(Media.fmtDuration(b.dur))「\(b.name)」")
+        }))
+
+        steps.append(("打开听录窗 → 屏幕上列的就是引擎那两条", 10, {
+            _ = self.openFeature(.audio)
+        }, {
+            let rows = AudioPanel.debugRows
+            guard rows.count == 2 else { return .wait }
+            if rows != ["书办验收 通话录音", "无标签第二条"] { return .bad("列成了 \(rows)") }
+            return .ok(rows.joined(separator: " / "))
+        }))
+
+        steps.append(("点第一条 → 解码成 WAV → 真的开始播", 45, {
+            tStart = Date()
+            self.audio.selectTrack(0)
+        }, {
+            if case .failed(let m) = self.audio.state { return .bad(m) }
+            if self.audio.state == .playing {
+                return .ok("解码 + 起播用了 \(String(format: "%.1f", Date().timeIntervalSince(tStart))) 秒")
+            }
+            return .wait
+        }))
+
+        steps.append(("进度自己往前走 · 总长用的是探测值", 12, {
+            posAtStart = self.audio.position
+        }, {
+            if self.audio.state != .playing { return .bad("中途不播了（\(self.audio.state)）") }
+            guard self.audio.position > posAtStart + 0.5 else { return .wait }
+            if self.audio.duration <= 0 || abs(self.audio.duration - 3) > 0.35 {
+                return .bad("总长不对：\(self.audio.duration)")
+            }
+            return .ok("位置 \(String(format: "%.2f", self.audio.position)) / 总长 \(String(format: "%.2f", self.audio.duration))")
+        }))
+
+        steps.append(("解码结果落在缓存目录里（下次秒开）", 6, {}, {
+            guard let cur = self.audio.current else { return .bad("没有正在播的曲目") }
+            let wav = AudioBoard.cachedWav(for: cur, in: cacheSnap)
+            let b = Media.bytes(of: wav)
+            if b <= 44 { return .bad("缓存里没有 WAV（找的是 \(wav.lastPathComponent)）") }
+            return .ok("\(wav.lastPathComponent) · \(Media.fmtSize(b))")
+        }))
+
+        // 这条是「关掉窗口不暂停」那条设计决定的锁：
+        // 哪天有人手滑在 closeFeature 里加一句 audio.stop()，这里立刻变红
+        steps.append(("关掉听录窗 · 声音继续放（边听边干活是这个功能的用法）", 12, {
+            self.closeFeature(.audio)
+            posAtClose = self.audio.position
+        }, {
+            if self.audio.state != .playing { return .bad("关窗把播放停了（\(self.audio.state)）") }
+            guard self.audio.position > posAtClose + 0.6 else { return .wait }
+            return .ok("窗口关着，位置从 \(String(format: "%.2f", posAtClose)) 走到 \(String(format: "%.2f", self.audio.position))")
+        }))
+
+        steps.append(("再打开还是那扇窗 · 还在放同一句", 10, {
+            _ = self.openFeature(.audio)
+        }, {
+            if self.audio.state != .playing { return .bad("重开就不播了（\(self.audio.state)）") }
+            guard AudioPanel.debugRows.count == 2 else { return .wait }
+            return .ok(AudioPanel.debugRows.joined(separator: " / "))
+        }))
+
+        steps.append(("从列表移出只摘行 · 录音原件还在盘上", 8, {
+            if let b = self.audio.tracks.last { self.audio.remove(b) }
+        }, {
+            if !fm.fileExists(atPath: wmaB.path) { return .bad("文件被删掉了！这是录音原件") }
+            guard self.audio.tracks.count == 1 else { return .wait }
+            return .ok("列表 1 条 · \(wmaB.lastPathComponent) 还在盘上")
+        }))
+
+        // 关掉窗口时那趟 2 秒轮询必须停下来：关着的时候从外面删文件，界面那份快照就该冻住。
+        // 去掉 FeaturePane.isOpen 那道闸门，这一条立刻变红（那一行会自己掉出去）。
+        //
+        // 比的是「关闭那一刻的快照」而不是固定条数 —— 上一步刚移出过一条，
+        // 这里再写死 2 条就会因为自己的前一步而假红（第一版就是这么翻车的）。
+        steps.append(("关着窗的时候不去盘上空转（轮询有 isOpen 闸门）", 14, {
+            self.closeFeature(.audio)
+            rowsAtClose = AudioPanel.debugRows
+            deletedOutside = false
+            tClosed = Date()
+        }, {
+            if !deletedOutside {
+                deletedOutside = true
+                // 相当于在 Finder 里删掉正在听的这条
+                try? fm.removeItem(atPath: wmaA.path)
+                say("    （窗口关着，从进程外删掉 \(wmaA.lastPathComponent)，等 8 秒看快照冻不冻住）")
+                return .wait
+            }
+            guard Date() > tClosed.addingTimeInterval(8) else { return .wait }
+            if AudioPanel.debugRows == rowsAtClose {
+                return .ok("快照停在关闭那刻：\(rowsAtClose.joined(separator: " / "))")
+            }
+            return .bad("窗口关着也去刷了盘（\(rowsAtClose) → \(AudioPanel.debugRows)）→ 定时器在后台空转")
+        }))
+
+        steps.append(("重开补齐：文件没了那行自己掉 · 播放也停下", 12, {
+            _ = self.openFeature(.audio)
+        }, {
+            guard AudioPanel.debugRows.isEmpty else { return .wait }
+            switch self.audio.state {
+            case .playing, .decoding: return .bad("录音原件都不在了还在播/还在解 → 进度条空转")
+            default: return .ok("列表空了 · 状态 \(self.audio.state)")
+            }
+        }))
+
+        steps.append(("后缀是 .wma 的坏文件：说得清的错，而不是卡死", 40, {
+            fm.createFile(atPath: wmaBad.path, contents: Data((0..<8192).map { _ in UInt8.random(in: 0...255) }))
+            self.audio.add([wmaBad])
+            self.audio.selectTrack(0)
+        }, {
+            if case .failed(let m) = self.audio.state {
+                return .ok(String(m.prefix(46)))
+            }
+            if self.audio.state == .playing { return .bad("一堆随机字节居然「播起来了」") }
+            return .wait
+        }))
+
+        // 拖放那条路平时验不到（要人肉从 Finder 拖），这里直接拿真 NSItemProvider 喂进去。
+        // 第二个 provider 指向不存在的文件，应当被挡在门外。
+        steps.append(("拖放那条路认得出真文件 · 不存在的挡在门外", 12, {
+            let ghost = dir.appendingPathComponent("并不存在.wma")
+            dropped = nil
+            AudioPanel.loadURLs(from: [NSItemProvider(object: wmaB as NSURL),
+                                       NSItemProvider(object: ghost as NSURL)]) { list in
+                dropped = list
+            }
+        }, {
+            guard let list = dropped else { return .wait }
+            if list == [wmaB] { return .ok("收到 \(wmaB.lastPathComponent) · 不存在的被丢掉") }
+            return .bad("解出来是 \(list.map(\.lastPathComponent))")
+        }))
+
+        steps.append(("收尾：停播、清列表、临时样本与缓存都掏干净", 8, {
+            self.audio.stop()
+            self.audio.clearList()
+            try? fm.removeItem(at: dir)
+            try? fm.removeItem(at: cacheSnap)
+        }, {
+            var left = 0
+            if fm.fileExists(atPath: dir.path) { left += 1 }
+            if fm.fileExists(atPath: cacheSnap.path) { left += 1 }
+            if left > 0 { return .bad("临时目录没清干净（剩 \(left) 处）") }
+            return .ok("")
+        }))
+
+        // 步进器本体：每 0.35 秒问一次当前这一步够不够。
+        // 用 asyncAfter 自己接自己、而不用 Timer —— Timer 的 block 在并发检查里是 @Sendable 的，
+        // 里面要调 @MainActor 的一堆方法，会招来一串「捕获了非 Sendable 的 self」的警告；
+        // 本项目要求零警告，asyncAfter 这条路在本仓库里已经验过是干净的。
+        var idx = 0
+        var started = false
+        var deadline = Date()
+        func tick() {
+            guard idx < steps.count else { done(); return }   // done() 里 exit，不会真回来
+            if !started {
+                steps[idx].start()
+                started = true
+                deadline = Date().addingTimeInterval(steps[idx].budget)
+            }
+            switch steps[idx].body() {
+            case .wait:
+                if Date() > deadline {
+                    check(false, "\(steps[idx].label) —— 等不到（超过 \(Int(steps[idx].budget)) 秒）")
+                    idx += 1
+                    started = false
+                }
+            case .ok(let detail):
+                check(true, detail.isEmpty ? steps[idx].label : "\(steps[idx].label)（\(detail)）")
+                idx += 1
+                started = false
+            case .bad(let why):
+                check(false, "\(steps[idx].label)：\(why)")
+                idx += 1
+                started = false
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { tick() }
+        }
+        tick()
     }
 
     /// 窗口截图里半透明像素的占比。窗口本身是 .clear 的，只有 SwiftUI 画到的地方才有底色，
@@ -3550,12 +3951,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         sub.addItem(.separator())
 
-        // 子功能都是独立窗口，⌘1/⌘2/⌘3 直接叫出来，比翻菜单快
+        // 子功能都是独立窗口，⌘1 日历 / ⌘2 录屏 / ⌘3 记事本 / ⌘4 听录，比翻菜单快
         let cal = sub.addItem(withTitle: "日历", action: #selector(showCalendar), keyEquivalent: "1")
         cal.target = self
         for f in FeaturePane.allCases {
             let it = sub.addItem(withTitle: f.title,
-                                 action: f == .record ? #selector(showRecord) : #selector(showNotes),
+                                 action: action(for: f),
                                  keyEquivalent: "\(f.rawValue + 1)")
             it.target = self
         }
@@ -3665,6 +4066,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc private func showRecord() { openFeature(.record) }
     @objc private func showNotes() { openFeature(.notes) }
+    @objc private func showAudio() { openFeature(.audio) }
+
+    /// FeaturePane → 菜单动作。
+    ///
+    /// ⚠️ 这里曾经是三处硬编码的二元判断 `f == .record ? #selector(showRecord) : #selector(showNotes)`
+    /// （主菜单、状态栏菜单、验收用例各一份）。加第三个子功能时它不会报错 ——
+    /// 会把「听录」静默挂成「记事本」，点了记事本弹出来，谁也不会想到是菜单挂错。
+    /// 所以收成一张表：加 case 时编译器逼在这里补一行。
+    private func action(for f: FeaturePane) -> Selector {
+        switch f {
+        case .record: return #selector(showRecord)
+        case .notes:  return #selector(showNotes)
+        case .audio:  return #selector(showAudio)
+        }
+    }
 
     @objc private func doRefresh() { store.refresh() }
     @objc private func doQuit() { NSApp.terminate(nil) }
@@ -3692,7 +4108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         for f in FeaturePane.allCases {
             let it = menu.addItem(withTitle: f.title,
-                                  action: f == .record ? #selector(showRecord) : #selector(showNotes),
+                                  action: action(for: f),
                                   keyEquivalent: "")
             it.target = self
             it.image = NSImage(systemSymbolName: f.icon, accessibilityDescription: f.title)

@@ -534,6 +534,10 @@ extension NoteStore {
             if ok { pass += 1; say("  ✓ \(name)") } else { fail += 1; say("  ✗ \(name) \(extra)") }
         }
 
+        // 自检自带临时目录，按 base/data/notes 断言。外面再传 WECAL_NOTES_DIR
+        // （那是给拍图/试拖动用的）会把目录劫走，两条落盘断言就假红了 —— 这里先清掉。
+        setenv("WECAL_NOTES_DIR", "", 1)
+
         let base = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("shuban-notes-test-\(UUID().uuidString.prefix(6))", isDirectory: true)
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
