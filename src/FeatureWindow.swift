@@ -19,6 +19,7 @@ import AppKit
 enum FeaturePane: Int, CaseIterable, Identifiable {
     case record = 1
     case notes = 2
+    case audio = 3
 
     var id: Int { rawValue }
 
@@ -26,6 +27,7 @@ enum FeaturePane: Int, CaseIterable, Identifiable {
         switch self {
         case .record: return "录屏"
         case .notes:  return "记事本"
+        case .audio:  return "听录"
         }
     }
 
@@ -34,6 +36,7 @@ enum FeaturePane: Int, CaseIterable, Identifiable {
         switch self {
         case .record: return "主屏 / 选区 / 副屏，带麦克风与点击高亮"
         case .notes:  return "自己的目录树，正文可贴图"
+        case .audio:  return "WMA 等格式的录音，拖进来就能听"
         }
     }
 
@@ -41,6 +44,7 @@ enum FeaturePane: Int, CaseIterable, Identifiable {
         switch self {
         case .record: return "record.circle"
         case .notes:  return "square.and.pencil"
+        case .audio:  return "headphones"
         }
     }
 
@@ -50,6 +54,8 @@ enum FeaturePane: Int, CaseIterable, Identifiable {
         case .record: return NSSize(width: 620, height: 690)
         // 记事本要横向铺开：左边树、右边正文，384 的家底装不下
         case .notes:  return NSSize(width: 780, height: 640)
+        // 听录：左曲目列表 + 右正在播放，底下通一条传输栏
+        case .audio:  return NSSize(width: 720, height: 620)
         }
     }
 
@@ -58,6 +64,8 @@ enum FeaturePane: Int, CaseIterable, Identifiable {
         // 再窄「录制范围 | 选项」两栏就挤了：倒计时胶囊会折行、选项说明全被截断
         case .record: return NSSize(width: 600, height: 520)
         case .notes:  return NSSize(width: 620, height: 440)
+        // 再窄「曲目 | 正在播放」就叠一块了，音量条也会被挤没
+        case .audio:  return NSSize(width: 620, height: 520)
         }
     }
 
@@ -65,6 +73,7 @@ enum FeaturePane: Int, CaseIterable, Identifiable {
         switch self {
         case .record: return NSSize(width: 900, height: 1000)
         case .notes:  return NSSize(width: 1200, height: 1000)
+        case .audio:  return NSSize(width: 1100, height: 1000)
         }
     }
 
@@ -73,7 +82,29 @@ enum FeaturePane: Int, CaseIterable, Identifiable {
         switch self {
         case .record: return "wecal.frame.record"
         case .notes:  return "wecal.frame.notes"
+        case .audio:  return "wecal.frame.audio"
         }
+    }
+
+    /// 窗口内部识别名（标题栏是隐的，不进存档）。和 frameKey 分开是因为
+    /// 存档键当年已经写进用户默认值了，改名等于丢位置
+    var panelName: String {
+        switch self {
+        case .record: return "record"
+        case .notes:  return "notes"
+        case .audio:  return "audio"
+        }
+    }
+
+    /// 这一扇窗此刻是不是摊在屏幕上。
+    ///
+    /// 子窗里的「对盘」轮询都得拿它挡一道：关窗只是 orderOut，SwiftUI 的 onDisappear
+    /// 不一定来，不挡的话一条 2 秒的定时器会在后台空转到天荒地老。
+    /// 靠窗口 identifier 认人（= 存档键，makePanel 里挂的）—— 不能拿标题认，
+    /// 标题是自由字符串，改起来没约束。
+    var isOpen: Bool {
+        let id = NSUserInterfaceItemIdentifier(frameKey)
+        return NSApp.windows.contains { $0.identifier == id && $0.isVisible }
     }
 }
 

@@ -81,12 +81,8 @@ struct RecordPanel: View {
         }
     }
 
-    /// 录屏窗现在是不是摊在屏幕上。窗口在 makePanel 里挂了 identifier（= 存档键），
-    /// 拿它认人 —— 不能用标题，标题是给内部识别用的普通字符串，改起来没约束。
-    private var paneIsOpen: Bool {
-        let id = NSUserInterfaceItemIdentifier(FeaturePane.record.frameKey)
-        return NSApp.windows.contains { $0.identifier == id && $0.isVisible }
-    }
+    /// 录屏窗现在是不是摊在屏幕上（认人的办法见 FeaturePane.isOpen）
+    private var paneIsOpen: Bool { FeaturePane.record.isOpen }
 
     // MARK: 头部
 
