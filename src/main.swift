@@ -370,6 +370,14 @@ final class Store: ObservableObject {
         if let m = ProcessInfo.processInfo.environment["WECAL_MODE"], let v = Int(m) {
             reopenPane = FeaturePane(rawValue: v)
         }
+        // 拍「正在录音」那张图会真开麦录几秒。不换走输出目录就是往真实的
+        // `~/Music/书办录音` 里塞样本（第一版拍图就这么留下了 7 个文件）。
+        // 用例那边有「必须在临时目录下」的硬校验，钩子这条路也得自己堵上。
+        if ProcessInfo.processInfo.environment["WECAL_AUDIO_SHOT_REC"] == "1",
+           (ProcessInfo.processInfo.environment["WECAL_AUDIO_REC"] ?? "").isEmpty {
+            setenv("WECAL_AUDIO_REC",
+                   (NSTemporaryDirectory() as NSString).appendingPathComponent("shuban-shot-rec"), 1)
+        }
         if let ds = ProcessInfo.processInfo.environment["WECAL_DAY"], let dt = Fmt.day.date(from: ds) {
             let day = cal.startOfDay(for: dt)
             selectedDay = day
@@ -2758,8 +2766,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let p = featurePanels[f.rawValue] else { return }
         // 笔记的正文是 0.5 秒防抖落盘的，窗一藏 onDisappear 不一定来，这里补一刀
         if f == .notes { notes.saveNow() }
-        // 听录**故意不在这里停**：关窗继续放才是这个功能的用法（边听录音边干活）。
+        // 听录**故意不在这里停播放**：关窗继续放才是这个功能的用法（边听录音边干活）。
         // 会真的把声音掐掉的只有一处 —— 开始录屏，因为外放会被麦克风收进成片。
+        // 但**录音必须收尾**：窗一关，录音台就看不见了，还在录就是偷偷录 —— 录到的存下来再停。
+        if f == .audio { audio.yieldRecording(to: "关闭听录窗口") }
         saveFrame(p)
         p.orderOut(nil)
         let tail = (f == .audio && audio.state.isBusy) ? "（播放继续）" : ""
@@ -2843,6 +2853,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.audio.toggle()
                 self.store.logUI("开始录屏 → 听录自动暂停（外放会被麦克风收进成片）")
             }
+            // 麦克风只有一个：录屏一开，听录这边的录音就得让位（录到的存下来，不删）
+            self.audio.screenRecording = active
+            if active { self.audio.yieldRecording(to: "开始录屏") }
         }
         // 出成片了把面板叫回前台，别让用户对着桌面找文件
         recorder.onPresentResult = { [weak self] in
@@ -3391,9 +3404,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         say("== 听录用例 ==")
         let env = ProcessInfo.processInfo.environment
-        guard env["WECAL_AUDIO_DIR"] != nil, env["WECAL_AUDIO_CACHE"] != nil else {
-            say("  ✗ 必须配 WECAL_AUDIO_DIR=<临时目录> 和 WECAL_AUDIO_CACHE=<临时目录> 跑：")
-            say("    前者存曲目列表、后者放解码出来的 WAV，不换走就是在拿人真的列表做试验")
+        guard env["WECAL_AUDIO_DIR"] != nil, env["WECAL_AUDIO_CACHE"] != nil,
+              let recEnv = env["WECAL_AUDIO_REC"], !recEnv.isEmpty else {
+            say("  ✗ 必须配 WECAL_AUDIO_DIR / WECAL_AUDIO_CACHE / WECAL_AUDIO_REC 跑：")
+            say("    第一个存曲目列表、第二个放解码出来的 WAV、第三个是录音输出目录 ——")
+            say("    不换走就是在拿人真的列表和真的录音夹做试验")
+            say("== 结果：0 通过 / 1 失败 ==")
+            exit(1)
+        }
+        // 录音那几步是真开麦。测完要能自己收拾干净，所以必须在临时目录里
+        guard recEnv.hasPrefix("/tmp/") || recEnv.hasPrefix(NSTemporaryDirectory()) else {
+            say("  ✗ WECAL_AUDIO_REC 要指到临时目录（现在：\(recEnv)）—— 用例会往里写样本录音")
             say("== 结果：0 通过 / 1 失败 ==")
             exit(1)
         }
@@ -3513,8 +3534,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         check(AudioPanel.url(from: Data("这玩意儿不是路径".utf8)) == nil,
               "认不出来的数据返回 nil，不硬凑一个 URL 出来")
 
+        // 录音：文件名、去重、电平归一、太短判定 —— 全是纯函数，先钉死
+        let stamp = AudioCapture.fileName(Date(timeIntervalSince1970: 1_764_000_000))
+        check(!stamp.contains("/") && stamp.hasSuffix(".m4a") && stamp.hasPrefix("录音 "),
+              "录音文件名不带斜杠、以 .m4a 结尾（\(stamp)）")
+        let dupSeed = dir.appendingPathComponent("dup.m4a")
+        fm.createFile(atPath: dupSeed.path, contents: Data("x".utf8))
+        let dup2 = AudioCapture.uniqueURL(dupSeed)
+        check(dup2.lastPathComponent == "dup 2.m4a",
+              "同名录音不覆盖，往后加号（\(dup2.lastPathComponent)）")
+        check(AudioCapture.norm(-160) == 0 && AudioCapture.norm(0) > 0.99
+                && AudioCapture.norm(-30) > AudioCapture.norm(-50),
+              "电平归一：静到 -160dB = 0，满格 ≈ 1，越响越大（-30dB → \(String(format: "%.2f", AudioCapture.norm(-30)))）")
+        check(AudioCapture.tooShort(0.3) && !AudioCapture.tooShort(1.2),
+              "短于 0.6 秒算误触（0.3 秒该丢，1.2 秒该留）")
+
         // 曲目列表存档换到临时目录后再动列表
         audio.clearList()
+
+        // 自动连播必须先关掉：样本只有 3 秒，播完它会自己滚到下一条去重新解码，
+        // 于是「关窗继续放 / 重开还在放同一句」这两步会偶发红在 decoding（真跑过半次）。
+        // 跑完在收尾那步还原 —— `autoNext` 的 didSet 会写 UserDefaults，不改回去就把用户的开关动了。
+        let autoNextWas = audio.autoNext
+        audio.autoNext = false
 
         var posAtStart = 0.0
         var posAtClose = 0.0
@@ -3678,15 +3720,130 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return .bad("解出来是 \(list.map(\.lastPathComponent))")
         }))
 
+        // ---- 录音：真开一次麦 ----
+        // 输出目录必须是临时目录：不换走就是往菲哥真实的「书办录音」里写样本
+        let recRoot = audio.capture.outDir?.path ?? ""
+        var recBlocked = false
+
+        steps.append(("点「录音」真录一段（要麦克风权限）", 10, {
+            self.audio.stop()
+            self.audio.clearList()
+            self.audio.beginRecording()
+        }, {
+            if case .failed(let m) = self.audio.capture.phase { return .bad("起录失败：\(m)") }
+            let s = self.audio.capture.seconds
+            if s < 1.5 { return .wait }
+            if self.audio.capture.level < 0 { return .bad("电平是负的（\(self.audio.capture.level)）") }
+            return .ok(String(format: "录到 %.1f 秒 · 电平 %.2f · %@", s, self.audio.capture.level,
+                              self.audio.capture.inputName))
+        }))
+
+        // 这条同时在验三件事：文件真写出来了、ffmpeg 认得出自己录的 m4a、录完不擅自出声
+        steps.append(("停录 → 文件落盘、进列表、选中但不出声", 20, {
+            self.audio.endRecording()
+        }, {
+            if self.audio.capture.isRecording { return .wait }
+            guard self.audio.tracks.count == 1, let t = self.audio.tracks.first else {
+                return .bad("列表里没有新录的那条（\(self.audio.tracks.count) 条）")
+            }
+            if t.ext != "m4a" { return .bad("录出来不是 m4a：\(t.url.lastPathComponent)") }
+            if !fm.fileExists(atPath: t.url.path) { return .bad("文件不见了：\(t.url.path)") }
+            if t.dur <= 0 { return .wait }              // 等探完时长
+            // 录完不许自己出声：连「解码中」也算 —— 否则屏上没声、一秒后突然出声更吓人
+            if self.audio.state != .idle {
+                return .bad("录完不该开始播/解码（现在是 \(self.audio.state)）—— 会突然从喇叭里放出来")
+            }
+            if self.audio.index != 0 { return .bad("没选中刚录的这条") }
+            let left = (try? fm.contentsOfDirectory(atPath: recRoot))?.filter { $0.hasSuffix(".m4a") } ?? []
+            if left.isEmpty { return .bad("目录里一个 m4a 都没有（\(recRoot)）") }
+            return .ok("\(t.url.lastPathComponent) · \(Media.fmtDuration(t.dur)) · \(Media.fmtSize(t.size)) · 状态 \(self.audio.state)")
+        }))
+
+        steps.append(("太短（0.3 秒）就丢掉，不往列表里塞垃圾文件", 12, {
+            self.audio.beginRecording()
+        }, {
+            if self.audio.capture.isRecording {
+                if self.audio.capture.seconds >= 0.3 { self.audio.endRecording() }
+                return .wait
+            }
+            if self.audio.tracks.count != 1 {
+                return .bad("短录音也进列表了（\(self.audio.tracks.count) 条）")
+            }
+            if !self.audio.recNote.contains("太短") {
+                return .bad("没说清为什么没留（状态栏写的是「\(self.audio.recNote)」）")
+            }
+            return .ok(self.audio.recNote)
+        }))
+
+        steps.append(("取消：文件一起删，不留半条", 12, {
+            self.audio.beginRecording()
+        }, {
+            if self.audio.capture.isRecording {
+                if self.audio.capture.seconds >= 0.3 { self.audio.cancelRecording() }
+                return .wait
+            }
+            if self.audio.tracks.count != 1 { return .bad("取消了还进列表（\(self.audio.tracks.count) 条）") }
+            let left = (try? fm.contentsOfDirectory(atPath: recRoot))?.filter { $0.hasSuffix(".m4a") } ?? []
+            if left.count != 1 { return .bad("取消后目录里剩 \(left) —— 该只剩正式录的那条") }
+            return .ok("只剩正式录的那 1 条")
+        }))
+
+        // 麦克风只有一个。录屏在跑的时候起录，要么拿不到设备、要么录一段静音 ——
+        // 所以要做的是「明确挡住 + 说清原因」，而不是让它悄悄录出一个空文件
+        steps.append(("录屏占着麦克风时点不动「录音」，且说清原因", 8, {
+            self.audio.screenRecording = true
+            recBlocked = !self.audio.beginRecording()
+        }, {
+            self.audio.screenRecording = false
+            if !recBlocked { return .bad("录屏中居然起录成功了 → 两边会互相抢麦克风") }
+            if case .failed(let m) = self.audio.state, m.contains("录屏") { return .ok(m) }
+            return .bad("没把原因写出来（state=\(self.audio.state)）")
+        }))
+
+        // 窗一关，录音台就从屏幕上消失了 —— 这时候还在录，就是「偷偷录」。
+        // 所以 closeFeature 必须收尾：录到的先存下来，只停不删（yieldRecording）。
+        // 谁哪天把 closeFeature 里那句 yieldRecording 删了，这一条立刻变红。
+        var closedWhileRec = false
+        steps.append(("关窗时正在录 → 自动收尾：存下来再停，不留偷偷录", 25, {
+            closedWhileRec = false
+            _ = self.openFeature(.audio)
+            self.audio.beginRecording()
+        }, {
+            if self.audio.capture.isRecording {
+                if closedWhileRec { return .bad("窗口早关了，录音还在跑 —— 这就是偷偷录") }
+                if self.audio.capture.seconds < 1.2 { return .wait }
+                self.closeFeature(.audio)
+                closedWhileRec = true
+                return .wait
+            }
+            if !closedWhileRec {
+                if case .failed(let m) = self.audio.capture.phase { return .bad("起录失败：\(m)") }
+                return .wait
+            }
+            guard self.audio.tracks.count == 2, let t = self.audio.tracks.last else {
+                return .bad("关窗那会儿录的没存下来（列表里 \(self.audio.tracks.count) 条，该 2 条）")
+            }
+            if !fm.fileExists(atPath: t.url.path) { return .bad("文件不见了：\(t.url.path)") }
+            if t.dur <= 0 { return .wait }
+            if self.audio.state != .idle {
+                return .bad("关窗收尾时顺手放出来了（\(self.audio.state)）")
+            }
+            if FeaturePane.audio.isOpen { return .bad("窗口没真关上") }
+            return .ok("窗已关 · \(t.url.lastPathComponent) 留下 \(Media.fmtDuration(t.dur))")
+        }))
+
         steps.append(("收尾：停播、清列表、临时样本与缓存都掏干净", 8, {
             self.audio.stop()
             self.audio.clearList()
+            self.audio.autoNext = autoNextWas
             try? fm.removeItem(at: dir)
             try? fm.removeItem(at: cacheSnap)
+            if !recRoot.isEmpty { try? fm.removeItem(atPath: recRoot) }
         }, {
             var left = 0
             if fm.fileExists(atPath: dir.path) { left += 1 }
             if fm.fileExists(atPath: cacheSnap.path) { left += 1 }
+            if !recRoot.isEmpty, fm.fileExists(atPath: recRoot) { left += 1 }
             if left > 0 { return .bad("临时目录没清干净（剩 \(left) 处）") }
             return .ok("")
         }))

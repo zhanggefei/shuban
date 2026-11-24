@@ -36,7 +36,7 @@ enum FeaturePane: Int, CaseIterable, Identifiable {
         switch self {
         case .record: return "主屏 / 选区 / 副屏，带麦克风与点击高亮"
         case .notes:  return "自己的目录树，正文可贴图"
-        case .audio:  return "WMA 等格式的录音，拖进来就能听"
+        case .audio:  return "现录一段，或把 WMA 拖进来听"
         }
     }
 

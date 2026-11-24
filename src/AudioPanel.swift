@@ -74,6 +74,11 @@ struct AudioPanel: View {
                audio.index < 0, !audio.tracks.isEmpty {
                 audio.selectTrack(0)
             }
+            // WECAL_AUDIO_SHOT_REC=1 起一段真录音，专门为了把「正在录音」那张卡拍下来。
+            // 这个态平时只有手点才有 —— 不摆出来的话，大计时、电平条、停止键的排版没人看过。
+            if ProcessInfo.processInfo.environment["WECAL_AUDIO_SHOT_REC"] == "1", !audio.recActive {
+                _ = audio.beginRecording()
+            }
         }
         .onChange(of: audio.tracks) { _ in sync() }
         .onReceive(listenTicker) { _ in
@@ -138,6 +143,10 @@ struct AudioPanel: View {
                     }
                 }
                 Spacer(minLength: 0)
+                // 听录的「录」在这里：红色那颗就是入口，录音中变成计时 + 停止
+                RecChip(capture: audio.capture, blocked: audio.screenRecording,
+                        onStart: { audio.beginRecording() },
+                        onStop: { audio.endRecording() })
                 // 解码是个看得见进度看不见的活儿，给个呼吸的胶囊，
                 // 免得人以为点没点着
                 if case .decoding(let p) = audio.state {
@@ -174,7 +183,7 @@ struct AudioPanel: View {
 
     private var subTitle: String {
         if Media.ffmpeg == nil { return "WMA 需要 ffmpeg 解码 · 请先安装" }
-        return "WMA 等格式录音 · 拖进来就能听"
+        return "能录也能听 · WMA 拖进来直接放"
     }
 
     private var ribbonDivider: some View {
@@ -191,8 +200,12 @@ struct AudioPanel: View {
             }
             HStack(alignment: .top, spacing: PZ(10)) {
                 listCard
-                nowPlayingCard
-                    .frame(width: PZ(258))
+                // 录音时右边这张卡就地变成录音台 —— 弹窗会挡手，换页会丢上下文，
+                // 而录音这件事本来就该「看得见在录、随手能停」
+                Group {
+                    if audio.recActive { recCard } else { nowPlayingCard }
+                }
+                .frame(width: PZ(258))
             }
         }
         .padding(.horizontal, PZ(14))
@@ -272,7 +285,7 @@ struct AudioPanel: View {
             Image(systemName: "arrow.down.doc")
                 .font(PF(24, .light))
                 .foregroundColor(Theme.sched.opacity(0.45))
-            Text("把录音文件拖进来 · 或点「＋ 添加」")
+            Text("拖进来听 · 或点「● 录音」现录一段")
                 .font(PF(10.5, .semibold)).foregroundColor(Theme.ink)
             Text("支持 WMA / MP3 / WAV / M4A / FLAC …\n从列表移出不会删你原来的文件")
                 .font(PF(9)).foregroundColor(Theme.inkSoft)
@@ -331,6 +344,56 @@ struct AudioPanel: View {
         (t.dur > 0 ? Media.fmtDuration(t.dur) : "时长未知")
             + " · " + Media.fmtSize(t.size)
             + " · " + t.ext.uppercased()
+    }
+
+    // MARK: 录音台（录音时顶掉「正在播放」那张卡）
+
+    private var recCard: some View {
+        card(stretch: true) {
+            VStack(alignment: .leading, spacing: 0) {
+                sectionLabel("正在录音")
+                // 计时在顶、出口紧随波形、说明钉在卡底；中间那段空白交给波形自己吃掉。
+                // 第一版是全部顶对齐 + 一句说明钉在卡底，默认尺寸下中间就拖出 300pt 死白，
+                // 窗口越高越空 —— 录音时这张卡是全窗唯一的焦点，不该飘在顶上。
+                RecTimer(capture: audio.capture).padding(.top, PZ(14))
+                RecMeter(capture: audio.capture, stretch: true)
+                    .padding(.vertical, PZ(9))
+                    .frame(maxHeight: PZ(190))
+                Spacer(minLength: PZ(2))
+                HStack(spacing: PZ(5)) {
+                    stopKey
+                    ghostButton("取消", icon: "xmark") { audio.cancelRecording() }
+                }
+                divider.padding(.bottom, PZ(7))
+                Text(audio.capture.outDir?.path.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+                     ?? "读出目录")
+                    .font(PF(8)).foregroundColor(Theme.inkSoft).lineLimit(1)
+                    .help("录音就存这儿")
+                Text("录完自动进列表，点一下就能回放 · 关窗会先收尾保存 · 录屏要用麦克风时会自动让开")
+                    .font(PF(8)).foregroundColor(Theme.inkSoft.opacity(0.75))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, PZ(5))
+            }
+        }
+    }
+
+    /// 停止：这是录音台上唯一「安全」的出口，给实心红，别让人在窗里找
+    private var stopKey: some View {
+        Button { audio.endRecording() } label: {
+            HStack(spacing: PZ(4)) {
+                Image(systemName: "stop.fill").font(PF(8.5, .bold))
+                Text("停止并保存").font(PF(9.5, .bold))
+            }
+            .foregroundColor(.white)
+            .padding(.horizontal, PZ(9)).padding(.vertical, PZ(5))
+            .background(RoundedRectangle(cornerRadius: PZ(7), style: .continuous)
+                .fill(Theme.redGradient))
+            .overlay(RoundedRectangle(cornerRadius: PZ(7), style: .continuous)
+                .stroke(Theme.todo.opacity(0.6), lineWidth: 0.8))
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut(.cancelAction)
+        .help("停录并存进列表（Esc 也行）")
     }
 
     // MARK: 正在播放
@@ -392,7 +455,9 @@ struct AudioPanel: View {
             return "点左边任意一条开始"
         }
         let tags = [t.artist, t.album].compactMap { $0 }.filter { !$0.isEmpty }
-        return tags.isEmpty ? "无标签 · 显示的是文件名" : tags.joined(separator: " · ")
+        // 这里说的是「艺人 / 专辑」这两个标签，跟标题无关 —— 原来写「无标签 · 显示的是文件名」，
+        // 可是标题明明就在上面一行，看着像自相矛盾
+        return tags.isEmpty ? "文件里没有艺人 / 专辑标签" : tags.joined(separator: " · ")
     }
 
     private var subline: String {
@@ -431,7 +496,7 @@ struct AudioPanel: View {
                 Text(Media.fmtDuration(scrub ?? audio.position))
                     .font(PF(9.5, .semibold, .rounded)).monospacedDigit()
                     .foregroundColor(Theme.inkSoft)
-                bar(frac, height: PZ(5), knob: true, enabled: audio.duration > 0,
+                bar(frac, height: PZ(5), knob: true, enabled: audio.duration > 0 && !audio.recActive,
                     onChange: { f in
                         guard audio.duration > 0 else { return }
                         scrub = Double(f) * audio.duration
@@ -447,9 +512,9 @@ struct AudioPanel: View {
                     .foregroundColor(Theme.inkSoft)
             }
             HStack(spacing: PZ(8)) {
-                roundKey("backward.fill", "上一条", enabled: !audio.tracks.isEmpty) { audio.prev() }
+                roundKey("backward.fill", "上一条", enabled: !audio.tracks.isEmpty && !audio.recActive) { audio.prev() }
                 playKey
-                roundKey("forward.fill", "下一条", enabled: !audio.tracks.isEmpty) { audio.next() }
+                roundKey("forward.fill", "下一条", enabled: !audio.tracks.isEmpty && !audio.recActive) { audio.next() }
                 HStack(spacing: PZ(4)) {
                     Circle().fill(dotColor).frame(width: PZ(5), height: PZ(5))
                     Text(statusText).font(PF(9.5)).foregroundColor(Theme.inkSoft).lineLimit(1)
@@ -507,8 +572,8 @@ struct AudioPanel: View {
             }
         }
         .buttonStyle(.plain)
-        .disabled(dec)
-        .help(busy && !dec ? "暂停" : "播放 / 暂停")
+        .disabled(dec || audio.recActive)
+        .help(audio.recActive ? "录音中不播（会把外放录进去）" : (busy && !dec ? "暂停" : "播放 / 暂停"))
     }
 
     private func roundKey(_ icon: String, _ help: String, enabled: Bool,
@@ -533,6 +598,7 @@ struct AudioPanel: View {
     }
 
     private var dotColor: Color {
+        if audio.recActive { return Theme.sched }
         switch audio.state {
         case .playing: return Theme.sched
         case .decoding: return Theme.todo
@@ -543,8 +609,10 @@ struct AudioPanel: View {
     }
 
     private var statusText: String {
+        if audio.recActive { return "正在录音 · Esc 停" }
+        if !audio.recNote.isEmpty { return audio.recNote }
         switch audio.state {
-        case .idle: return audio.tracks.isEmpty ? "把录音拖进来就能听" : "就绪 · 点任意一条开始"
+        case .idle: return audio.tracks.isEmpty ? "把录音拖进来 · 或点「录音」现录一段" : "就绪 · 点任意一条开始"
         case .decoding(let p): return p > 0 ? "解码中 \(Int(p * 100))%" : "解码中…"
         case .playing: return "正在播放"
         case .paused: return "已暂停"
@@ -827,6 +895,121 @@ private struct WaveBars: View {
         .onAppear {
             withAnimation(.easeInOut(duration: 0.42).repeatForever(autoreverses: true)) { on = true }
         }
+    }
+}
+
+/// 「● 录音」那颗红键。录音中变成「计时 · 停止」，点一下收工。
+/// 自己观察 AudioCapture：电平是 20Hz 在变的，只有这一小块跟着重画，
+/// 不能让整页（列表 + 传输条）陪着一起刷。
+private struct RecChip: View {
+    @ObservedObject var capture: AudioCapture
+    var blocked: Bool
+    var onStart: () -> Void
+    var onStop: () -> Void
+    @State private var blink = false
+
+    var body: some View {
+        Button {
+            if capture.isRecording { onStop() }
+            else if capture.phase.isArmed { capture.cancel() }
+            else { onStart() }
+        } label: {
+            HStack(spacing: PZ(4)) {
+                Circle()
+                    .fill(Color.white.opacity(capture.isRecording && blink ? 0.35 : 1))
+                    .frame(width: PZ(5.5), height: PZ(5.5))
+                Text(label).font(PF(9, .bold, .rounded)).monospacedDigit()
+            }
+            .foregroundColor(.white)
+            .padding(.horizontal, PZ(8)).padding(.vertical, PZ(3.5))
+            .background(
+                Capsule().fill(dim ? AnyShapeStyle(Theme.inkSoft.opacity(0.55))
+                                   : AnyShapeStyle(Theme.redGradient))
+            )
+            .overlay(Capsule().stroke(Color.white.opacity(0.35), lineWidth: 0.7))
+        }
+        .buttonStyle(.plain)
+        .disabled(dim)
+        .help(help)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) { blink = true }
+        }
+    }
+
+    /// 录屏占着麦克风的时候点不动，但样子要还在 —— 藏起来会让人以为功能没了
+    private var dim: Bool { blocked && !capture.isBusy }
+
+    private var label: String {
+        if capture.isRecording { return Media.fmtDuration(capture.seconds) + " · 停止" }
+        if capture.phase.isArmed { return "等授权" }
+        return "录音"
+    }
+
+    private var help: String {
+        if capture.isRecording { return "停录并存进列表（Esc 也行）" }
+        if blocked { return "录屏正占着麦克风：先把录屏停下" }
+        return "现录一段（麦克风），录完自动进列表"
+    }
+}
+
+/// 录音台的大计时
+private struct RecTimer: View {
+    @ObservedObject var capture: AudioCapture
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: PZ(1)) {
+            Text(Media.fmtDuration(capture.seconds))
+                .font(PF(28, .heavy, .rounded)).monospacedDigit()
+                .foregroundColor(Theme.sched)
+            Text(sub).font(PF(8.5)).foregroundColor(Theme.inkSoft).lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var sub: String {
+        if capture.phase.isArmed { return "等系统问你要麦克风授权…" }
+        return "正在录 · " + capture.inputName
+    }
+}
+
+/// 实时电平：一串竖条，新的从右边进来。
+/// 这是录音时唯一能证明「真的在收声」的东西 —— 光有计时，麦克风坏了也一样在走。
+private struct RecMeter: View {
+    @ObservedObject var capture: AudioCapture
+    /// 卡片给多高就画多高。录音卡里让它把空白吃掉 —— 录音时这张卡是全窗唯一的焦点，
+    /// 一条 46pt 的细带子悬在 700pt 的卡片中央，看着就像没画完的占位符。
+    var stretch = false
+
+    var body: some View {
+        ZStack {
+            if stretch {
+                GeometryReader { g in bars(inner: g.size.height) }
+            } else {
+                bars(inner: PZ(46))
+            }
+        }
+        .frame(height: stretch ? nil : PZ(46))
+        .frame(maxWidth: .infinity, maxHeight: stretch ? .infinity : nil)
+        .background(
+            RoundedRectangle(cornerRadius: PZ(8), style: .continuous)
+                .fill(Theme.sched.opacity(0.05))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: PZ(8), style: .continuous)
+                .stroke(Theme.sched.opacity(0.14), lineWidth: 0.8)
+        )
+    }
+
+    private func bars(inner: CGFloat) -> some View {
+        HStack(alignment: .center, spacing: PZ(1.6)) {
+            ForEach(Array(capture.history.enumerated()), id: \.offset) { _, v in
+                Capsule()
+                    .fill(Theme.sched.opacity(0.30 + 0.6 * Double(v)))
+                    .frame(width: PZ(2.6), height: max(PZ(2.5), (inner - PZ(12)) * CGFloat(v)))
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, PZ(2))
     }
 }
 
