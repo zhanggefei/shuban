@@ -94,6 +94,18 @@ final class AudioBoard: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// 关键动作写 data/ui.log（点了什么、ffmpeg 什么返回码，事后无从判断时全靠它）
     var onLog: ((String) -> Void)?
 
+    // MARK: 录音
+
+    /// 录音台。电平、计时这些 20Hz 变的值都在它自己身上，
+    /// 只有「进 / 出录音态」这一个布尔往回流 —— 否则整页会跟着电平 20Hz 重画
+    let capture = AudioCapture()
+    /// 此刻是不是在录音（界面据此把右边那张卡换成录音台）
+    @Published private(set) var recActive = false
+    /// 录音相关的最后一句话（「只录到 0.3 秒，太短没留」这种），下一动作就清掉
+    @Published private(set) var recNote = ""
+    /// 录屏正在跑：麦克风在它手里，这时候不许起录（会拿不到设备或录一段静音）
+    @Published var screenRecording = false
+
     // MARK: 路径
 
     /// 解码缓存目录。默认放 Caches（系统会在盘紧时清），验收用 WECAL_AUDIO_CACHE 换走
@@ -152,6 +164,62 @@ final class AudioBoard: NSObject, ObservableObject, AVAudioPlayerDelegate {
         // 上次存的列表只记了路径，时长/标题是当场探出来的 —— 不补这一刀，
         // 重启之后整列都写着「时长未知」，要点开每条才一条条长回来（2026-11-24 拍图时发现）
         probeAll()
+        // 录音台：录完的文件直接进列表，不经过用户手里的「添加」
+        capture.configure(projectDir: projectDir)
+        capture.onLog = { [weak self] line in self?.onLog?(line) }
+        capture.onPhase = { [weak self] on in self?.recActive = on }
+        capture.onFinish = { [weak self] url, sec in self?.absorbRecording(url, sec) }
+        capture.onDrop = { [weak self] msg in self?.recNote = msg }
+    }
+
+    // MARK: - 录音
+
+    /// 起录。返回 false = 没开成（界面据此保持原样）。
+    ///
+    /// 两件事必须先做掉：
+    /// 1. **停掉正在放的声音** —— 否则外放会被自己录进去，回放时听到的是双重人声；
+    /// 2. **让开录屏** —— 麦克风只能被一方拿住，硬抢的结果是「两个都没声音」。
+    @discardableResult
+    func beginRecording() -> Bool {
+        guard !capture.isBusy else { return false }
+        if screenRecording {
+            state = .failed("录屏正占着麦克风：先把录屏停下，再来录音")
+            onLog?("录音未开始：录屏进行中")
+            return false
+        }
+        stop()
+        recNote = ""
+        capture.start()
+        return true
+    }
+
+    /// 停录并保存（正常路径）
+    func endRecording() { capture.stop() }
+
+    /// 取消：连文件一起删
+    func cancelRecording() { capture.cancel() }
+
+    /// 外面（录屏 / 关窗）要收走麦克风时的统一入口：**录到的保住**，只停不删。
+    /// 录音和「正在播放」不一样 —— 播放中断是少听一段，录音中断是丢现场。
+    func yieldRecording(to why: String) {
+        if capture.isRecording {
+            capture.stop()
+            onLog?("\(why) → 录音已保存并停止")
+        } else if capture.phase.isArmed {
+            capture.cancel()
+        }
+    }
+
+    /// 录完的文件入列表。
+    /// **不自动播** —— 录完往往是接着说的，突然从喇叭里放出自己的声音很怪；
+    /// 选中高亮就好，要听自己点。
+    private func absorbRecording(_ url: URL, _ sec: Double) {
+        add([url])
+        if let i = tracks.firstIndex(where: { $0.url.path == url.path }) {
+            selectTrack(i, play: false)
+        }
+        recNote = ""
+        onLog?("听录录到一条 \(url.lastPathComponent)（\(Media.fmtDuration(sec))）")
     }
 
     // MARK: - 列表：盘上的镜像
