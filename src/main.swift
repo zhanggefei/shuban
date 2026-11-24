@@ -3134,6 +3134,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
 
+        // 验收钩子：复制粘贴。⌘C/⌘V/⌘A 的按键绑定挂在「编辑」菜单上，主菜单少了那份
+        // 菜单，全应用的文本框就一起哑了 —— 这东西光读代码看不出来，得真按键、真看剪贴板。
+        if ProcessInfo.processInfo.environment["WECAL_EDIT_TEST"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                self?.runEditTest()
+            }
+        }
+
         // 验收钩子：验「最近录制」那一列的活气 —— 文件在别处被删掉，这一行要自己消失。
         // 光验 RecordPanel.scan 不够（那是纯函数，本来就对）：真会坏的是
         // ①轮询压根没跑 ②窗口认错了人、只在 onAppear 刷了一次 ③把录制中的 0 字节临时件也列出来。
@@ -3951,6 +3959,257 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    /// 复制粘贴验收。
+    ///
+    /// 为什么值得单独一套：⌘C / ⌘V / ⌘A 的按键绑定不是 NSTextView 写死的，是挂在主菜单
+    /// 「编辑」那几项上的。这个 app 的菜单是手搓的（没有 nib），少一份「编辑」菜单，
+    /// 全应用所有输入框就一起收不到这些键 —— 打字正常、粘贴没反应，代码里完全看不出来。
+    /// 子窗还是 nonactivatingPanel，点它不会让 app 变活跃，而菜单只在 app 活跃时参与分发，
+    /// 所以修复是两处：菜单（setupMainMenu）+ 窗一变 key 就激活 app（windowDidBecomeKey）。
+    /// 菜单那半边做过对抗对照（不挂这份菜单 → 11 条里 5 条红，贴图那条仍绿）；
+    /// 激活那半边只能钉「判断」（哪扇窗有资格抢焦点）—— 这个进程里 `deactivate()`/`hide(nil)`
+    /// 都不生效，造不出「app 在后台」的起点，效果得手动验。别把这条写成「摘掉必红」。
+    ///
+    /// 跑法（**别从 shell 直 exec**）：进程自己 `NSApp.activate` 抢前台不稳，会假红一片；
+    /// 走 README 取舍第 15 条那条路，stdout 用 open 的 `--stdout` 兜出来：
+    /// `open -n --stdout /tmp/edit.log --env WECAL_EDIT_TEST=1 --env WECAL_NOTES_DIR=/tmp/x build/书办.app`
+    private func runEditTest(retry: Int = 0) {
+        var pass = 0, fail = 0
+        func check(_ ok: Bool, _ label: String) {
+            say(ok ? "  ✓ \(label)" : "  ✗ \(label)")
+            if ok { pass += 1 } else { fail += 1 }
+        }
+        func done() {
+            say("== 结果：\(pass) 通过 / \(fail) 失败 ==")
+            exit(fail == 0 ? 0 : 1)
+        }
+        let pb = NSPasteboard.general
+        // 这条用例会往笔记正文里真粘字、真贴一张图，正文一变就会落盘 ——
+        // 所以笔记目录必须换到临时目录，不许拿菲哥真实的笔记当试验田。
+        guard let notesDir = ProcessInfo.processInfo.environment["WECAL_NOTES_DIR"], !notesDir.isEmpty else {
+            say("  ✗ 这个用例必须配 WECAL_NOTES_DIR=<临时目录> 跑：它会真改正文并落盘")
+            say("== 结果：0 通过 / 1 失败 ==")
+            exit(1)
+        }
+        // 剪贴板是用户的，跑完要还回去（只保得住文本那一种，够用了）
+        let pbBefore = pb.string(forType: .string)
+        func restorePB() {
+            pb.clearContents()
+            if let s = pbBefore { pb.setString(s, forType: .string) }
+        }
+
+        // ① 结构：主菜单里得有「编辑」，四项快捷键都得在。少了这份菜单，下面全都白搭
+        let edit = NSApp.mainMenu?.items.compactMap(\.submenu).first { $0.title == "编辑" }
+        if retry == 0 {
+            say("== 复制粘贴用例 ==")
+            check(edit != nil, "主菜单里有「编辑」子菜单")
+            if let edit {
+                let keys = edit.items.map(\.keyEquivalent)
+                check(keys.contains("c") && keys.contains("v") && keys.contains("x") && keys.contains("a"),
+                      "剪切 / 复制 / 粘贴 / 全选 的快捷键都挂上了（⌘X ⌘C ⌘V ⌘A → \(keys.filter { !$0.isEmpty })）")
+                let actions = edit.items.compactMap(\.action).map { NSStringFromSelector($0) }
+                check(actions.contains("paste:") && actions.contains("copy:"),
+                      "动作是标准的 copy: / paste:（走响应链，谁在第一响应者谁处理）")
+            }
+        }
+
+        let p = openFeature(.notes)
+        p.makeKeyAndOrderFront(nil)
+        // 认真的背景：`open` 起来的 app 常常不在前台，而 nonactivatingPanel 在 app 不活跃时
+        // 连 key 都变不了 —— 菜单的动作就没人接。所以前台由第 ⓪-b 步负责摆好；
+        // 「窗变 key 时该不该把 app 抢过来」这个判断由第 ⓪-a 步单独钉。
+        guard let tv = Self.findTextView(p.contentView) else {
+            if retry < 12 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                    self?.runEditTest(retry: retry + 1)
+                }
+                return
+            }
+            say("  ✗ 找不到记事本正文（连试 12 次）")
+            say("== 结果：0 通过 / 1 失败 ==")
+            exit(1)
+        }
+        p.makeFirstResponder(tv)
+        // 刚开窗时 app 通常还在后台（下面第 ⓪ 步负责把它带到前台），这行是给失败时对照用的
+        say("  开窗后立刻：记事本窗 isKey=\(p.isKeyWindow) · app isActive=\(NSApp.isActive) · 笔记目录 \(notesDir)")
+
+        func key(_ ch: String, code: UInt16, cmd: Bool, win: NSWindow) -> NSEvent? {
+            NSEvent.keyEvent(with: .keyDown, location: .zero,
+                             modifierFlags: cmd ? [.command] : [],
+                             timestamp: ProcessInfo.processInfo.systemUptime,
+                             windowNumber: win.windowNumber, context: nil,
+                             characters: ch, charactersIgnoringModifiers: ch,
+                             isARepeat: false, keyCode: code)
+        }
+        // 投递走 `NSApp.sendEvent`（同步、立刻分发），不走 `postEvent`（塞回事件队列等下一轮）。
+        // 试过 postEvent：由 `open` 起的进程里五条断言全红，而窗口确实是 key、app 确实活跃 ——
+        // 事件根本没进应用的队列，合成按键在「WindowServer → 应用」这一跳被丢掉了。
+        // sendEvent 是 AppKit 处理真实按键的同一条路（先给主菜单 performKeyEquivalent，
+        // 没人认领才交给 key 窗的响应链），少的只是 WindowServer 那一跳，正好是要验的那一段。
+        func press(_ ch: String, _ code: UInt16, shift: Bool = false, win: NSWindow) {
+            guard let e = key(ch, code: code, cmd: true, win: win) else { return }
+            NSApp.sendEvent(e)
+        }
+        /// 失败时把前提状态一起打出来：这一串红到底是「菜单没绑上」还是「窗/应用不在场」，
+        /// 只看正文内容分不出来（踩过：postEvent 那版五条全红，看着像菜单坏了）。
+        func premise() -> String { "窗isKey=\(p.isKeyWindow) · app活跃=\(NSApp.isActive) · 第一响应者=\(p.firstResponder.map { String(describing: type(of: $0)) } ?? "nil")" }
+
+        // 每步：先做一次动作，再反复问「好了没」。ask 返回 nil = 还没好，"" = 成了，
+        // 非空 = 为什么不成。用 asyncAfter 自己接自己而不是 Timer —— 和听录/录屏那两张
+        // 步进表同一个理由：Timer 的 block 是 @Sendable，碰主线程对象就出 warning。
+        var steps: [(label: String, budget: Double, act: () -> Void, ask: () -> String?)] = []
+
+        // ⓪-a 「窗一变 key 就把 app 带到前台」这件事的**判断**部分：只有记事本抢焦点。
+        //     效果那一半（真把 app 激活）在这里测不了：`NSApp.deactivate()` 和 `NSApp.hide(nil)`
+        //     在这个进程里都不生效（实测 isActive 一直是 true），也就造不出「app 在后台」的起点；
+        //     只能手动验 —— 切去别的软件，再点一下记事本窗。判断错成「所有窗都抢」是会坏的
+        //     （听录那扇窗抢焦点会把用户正在打的东西打断），所以把判断本身钉住。
+        steps.append(("只有记事本窗会把 app 抢到前台（日历/录屏/听录都不抢）", 4, {
+            check(p.delegate === self, "记事本窗的 delegate 挂在 AppDelegate 上（不然 didBecomeKey 根本不会来）")
+        }, {
+            var bad: [String] = []
+            if !Self.bringsAppToFront(p, notes: p) { bad.append("记事本窗自己不算") }
+            if let cal = self.panel, Self.bringsAppToFront(cal, notes: p) { bad.append("日历窗也跟着抢") }
+            if Self.bringsAppToFront(p, notes: nil) { bad.append("记事本窗没开时还在抢") }
+            return bad.isEmpty ? "" : bad.joined(separator: " · ")
+        }))
+
+        // ⓪-b 前提状态：窗是 key、app 是活跃。缺一个，「编辑」菜单的动作就没人接 ——
+        //     `NSApp.sendEvent` 里主菜单 performKeyEquivalent 命中之后，动作是发给 **key 窗**
+        //     的响应链的，没有 key 窗就等于无声无息（这一轮实测：窗不是 key 时 ⌘V/⌘C/⌘A 三条全红，
+        //     而走按键监视器的「贴图」照样绿，正好把两条路分开照出来了）。
+        //     为什么在这里自己 activate：`open` 起来的进程经常压根不在前台（同一份代码两次跑，
+        //     一次 isActive=true 一次 false），而 nonactivatingPanel 在 app 不活跃时
+        //     `makeKeyAndOrderFront` 也不会让它变 key（实测）。delegate 里那一下的判断
+        //     由 ⓪-a 单独钉，这里只负责把场地摆好。
+        steps.append(("前提：记事本窗是 key 且 app 活跃（菜单才参与按键分发）", 8, {
+        }, {
+            // 每来问一次就补一刀：activate 和 makeKeyAndOrderFront 都是下一轮才落地的脾气，
+            // 单发一次不稳。等到状态对了就不再动手 —— makeKeyAndOrderFront 会把第一响应者复位，
+            // 明明已经是 key 还反复点，会把下一步设好的正文焦点抢回去（踩过）。
+            if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+            if !p.isKeyWindow { p.makeKeyAndOrderFront(nil) }
+            if !p.isKeyWindow { return "记事本窗不是 key 窗" }
+            return NSApp.isActive ? "" : "app 在后台（isActive=false）→ 菜单不参与按键分发"
+        }))
+
+        // ① 粘贴：剪贴板里放一段字，光标停在末尾，⌘V 该进正文
+        steps.append(("记事本正文 ⌘V 能粘文字", 4, {
+            p.makeFirstResponder(tv)
+            tv.string = "第一段"
+            tv.setSelectedRange(NSRange(location: (tv.string as NSString).length, length: 0))
+            pb.clearContents()
+            pb.setString("粘进来的一句话", forType: .string)
+            press("v", 9, win: p)
+        }, {
+            if tv.string.contains("粘进来的一句话") { return "" }
+            return "正文还是 \(tv.string.debugDescription) · \(premise())"
+        }))
+
+        // ③ 复制：全选正文后 ⌘C，剪贴板里该出现正文
+        steps.append(("记事本正文 ⌘C 能复制", 4, {
+            tv.setSelectedRange(NSRange(location: 0, length: (tv.string as NSString).length))
+            pb.clearContents()
+            press("c", 8, win: p)
+        }, {
+            let got = pb.string(forType: .string) ?? ""
+            return got.contains("第一段") && got.contains("粘进来的一句话")
+                ? "" : "剪贴板是 \(got.prefix(24).debugDescription)"
+        }))
+
+        // ④ 全选
+        steps.append(("记事本正文 ⌘A 能全选", 4, {
+            tv.setSelectedRange(NSRange(location: 0, length: 0))
+            press("a", 0, win: p)
+        }, {
+            let n = (tv.string as NSString).length
+            return tv.selectedRange().length == n ? "" : "选中 \(tv.selectedRange().length) / 共 \(n)"
+        }))
+
+        // ⑤ 剪贴板里是位图 → ⌘V 仍然走「贴图」，不能被并进来的编辑键分支抢走。
+        //    贴图与粘文字共用 ⌘V，两条规矩合成一个监视器之后，谁先谁后必须验一遍。
+        var imgsBefore = -1
+        var bodyBefore = ""
+        // 数全库的图，而不是「当前选中那条」的图：贴完图这一下选中项可能自己挪走
+        // （试运行看到过），盯着选中项会假红成「0 张 → 0 张」，其实图好好躺在另一条上。
+        func totalImages() -> Int { self.notes.nodes.reduce(0) { $0 + $1.images.count } }
+        steps.append(("剪贴板里是图 → ⌘V 仍然贴图", 5, {
+            imgsBefore = totalImages()
+            bodyBefore = tv.string
+            pb.clearContents()
+            if let bmp = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 8,
+                                          bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                          isPlanar: false, colorSpaceName: .deviceRGB,
+                                          bytesPerRow: 0, bitsPerPixel: 0),
+               let tiff = bmp.representation(using: .tiff, properties: [:]) {
+                pb.setData(tiff, forType: .tiff)
+            }
+            press("v", 9, win: p)
+        }, {
+            let after = totalImages()
+            if after != imgsBefore + 1 {
+                return "贴图没成（\(imgsBefore) 张 → \(after) 张 · status=\(self.notes.status)）"
+            }
+            return tv.string == bodyBefore ? "" : "贴图顺手往正文塞了字：\(tv.string.debugDescription)"
+        }))
+
+        // ⑥ 待办输入框：日历窗底栏那个 SwiftUI TextField，背后是 field editor，
+        //    一样得靠 paste: 才认 ⌘V —— 它和笔记正文是两条不同的响应链。
+        var todoField: NSTextField? = nil
+        steps.append(("待办输入框 ⌘V 能粘文字", 5, {
+            guard let panel = self.panel,
+                  let field = Self.findField(panel.contentView, placeholder: "写条待办") else { return }
+            todoField = field
+            // 不再自己 activate：app 从第 ⓪ 步起就该是活跃的，这里只是把焦点挪到日历窗的输入框。
+            panel.makeKeyAndOrderFront(nil)
+            panel.makeFirstResponder(field)
+            pb.clearContents()
+            pb.setString("买杯咖啡", forType: .string)
+            press("v", 9, win: panel)
+        }, {
+            guard let f = todoField else { return "找不到待办输入框（日历窗底栏那个）" }
+            return f.stringValue.contains("买杯咖啡") ? "" : "输入框里是 \(f.stringValue.debugDescription)"
+        }))
+
+        var idx = 0
+        var started = false
+        var deadline = Date()
+        func tick() {
+            guard idx < steps.count else {
+                todoField?.stringValue = ""
+                restorePB()
+                done()
+                return
+            }
+            if !started {
+                steps[idx].act()
+                started = true
+                deadline = Date().addingTimeInterval(steps[idx].budget)
+            }
+            if let why = steps[idx].ask() {
+                check(why.isEmpty, why.isEmpty ? steps[idx].label : "\(steps[idx].label)：\(why)")
+                idx += 1
+                started = false
+            } else if Date() > deadline {
+                check(false, "\(steps[idx].label) —— 等不到（超过 \(Int(steps[idx].budget)) 秒）")
+                idx += 1
+                started = false
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { tick() }
+        }
+        tick()
+    }
+
+    /// 找某个占位符的输入框（SwiftUI 的 TextField 落下来就是 NSTextField）
+    static func findField(_ v: NSView?, placeholder: String) -> NSTextField? {
+        guard let v else { return nil }
+        if let f = v as? NSTextField, f.placeholderString?.contains(placeholder) == true { return f }
+        for s in v.subviews {
+            if let hit = findField(s, placeholder: placeholder) { return hit }
+        }
+        return nil
+    }
+
     static func findTextView(_ v: NSView?) -> NSTextView? {
         var hits: [NSTextView] = []
         collectTextViews(v, &hits)
@@ -4032,11 +4291,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 笔记页的 ⌘V 贴图。
     /// TextEditor 只会把剪贴板里的文本贴进来，图片它不管 —— 所以在按键层截一道：
-    /// 剪贴板里确实是图就落盘挂到当前笔记上并吞掉事件，是纯文本就原样放行，
+    /// 剪贴板里确实是位图就落盘挂到当前笔记上并吞掉事件，是纯文本就原样放行，
     /// 正文照常粘文字，两种操作不打架。
+    ///
+    /// **别在这里顺手接管 ⌘C/⌘X/⌘A/⌘Z**：试过一版，用 `NSApp.sendAction` 把动作发给
+    /// 第一响应者，结果 SwiftUI 的 PlatformTextView 一律回「我处理了」却什么也不做
+    /// （`sendAction` 返回 true，正文一个字没变，剪贴板也没变），反而把本来该由菜单
+    /// 处理的事件吞掉了 —— 三条用例一起变红。这些键的正主是「编辑」菜单（见 setupMainMenu），
+    /// 让它自己走标准分发；子窗是 nonactivatingPanel 这个坑，用「窗一变 key 就激活 app」
+    /// 来解决（见 windowDidBecomeKey），别再往按键层加戏。
     private func installPasteMonitor() {
         pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            guard let self, let notesWin = self.featurePanel(.notes), e.window === notesWin else { return e }
+            guard let self else { return e }
+            guard let notesWin = self.featurePanel(.notes), e.window === notesWin else { return e }
             let cmd = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
             guard cmd.contains(.command), cmd.intersection([.option, .control]).isEmpty else { return e }
             guard e.charactersIgnoringModifiers?.lowercased() == "v" else { return e }
@@ -4071,6 +4338,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let upperH = max(lim.min.height, min(lim.max.height, vf.height))
         return NSSize(width: min(max(frameSize.width, lim.min.width), upperW),
                       height: min(max(frameSize.height, lim.min.height), upperH))
+    }
+
+    /// 记事本窗一变 key 就把 app 激活。
+    ///
+    /// 子窗都是 `nonactivatingPanel`：点它只会让这扇窗变成 key，app 仍然待在后台。
+    /// 打字不受影响（按键发给 key 窗），但 **⌘X/⌘C/⌘V/⌘A/⌘Z 全哑** —— 这些键的绑定挂在
+    /// 「编辑」菜单上，菜单只在 app 活跃时才参与分发。日历窗底栏那个待办输入框早就单独
+    /// 处理过同一件事（`composerFocused` 一变就 activate），这里是同一个坑的另一半。
+    /// 只给记事本加：它本来就是拿来说「我要开始写东西」的那扇窗，抢焦点是对的；
+    /// 录屏、听录、日历窗保持不抢焦点。
+    nonisolated func windowDidBecomeKey(_ notification: Notification) {
+        Task { @MainActor [weak self] in
+            guard let self, let w = notification.object as? NSWindow,
+                  Self.bringsAppToFront(w, notes: self.featurePanel(.notes)) else { return }
+            if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+        }
+    }
+
+    /// 哪扇窗变 key 时该把整个 app 抢到前台 —— 只有记事本。单独拎成纯判断是为了能验：
+    /// 「只认记事本、别的窗都不抢」这件事写成一行比对就没法测了。
+    /// `notes == nil`（记事本窗还没开或已销毁）一律不抢。
+    nonisolated static func bringsAppToFront(_ w: NSWindow, notes: NSWindow?) -> Bool {
+        guard let notes else { return false }
+        return w === notes
     }
 
     /// 缩放：只有日历窗驱动全局字号档，子功能窗口用各自固定的字号（PZ/PF）
@@ -4128,6 +4419,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         quit.target = self
 
         appItem.submenu = sub
+
+        // 「编辑」菜单不是装饰：⌘X/⌘C/⌘V/⌘A/⌘Z 这些按键绑定就注册在这几行上。
+        // 这个 app 的菜单是手搓的（没有 nib），少一份菜单 = 全应用的文本框一起收不到这些键，
+        // 表现就是「能打字、粘不了」。target 一律留 nil —— 让动作走响应链，
+        // 谁在第一响应者（正文编辑器 / 待办输入框的 field editor）谁处理。
+        let editItem = NSMenuItem()
+        main.addItem(editItem)
+        let edit = NSMenu(title: "编辑")
+        edit.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "删除", action: #selector(NSText.delete(_:)), keyEquivalent: "")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+
         NSApp.mainMenu = main
     }
 
