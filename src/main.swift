@@ -3142,6 +3142,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
 
+        // 验收钩子：富文本。分成两半 —— 属性/洗白/RTF 往返/store 落盘这些纯逻辑，
+        // 和「真在窗口里按 ⌘B、⌘Z、⌘V」那一段。前半不会因为窗口没前台而假红，后半会。
+        if ProcessInfo.processInfo.environment["WECAL_RICH_TEST"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                self?.runRichTest()
+            }
+        }
+
         // 验收钩子：验「最近录制」那一列的活气 —— 文件在别处被删掉，这一行要自己消失。
         // 光验 RecordPanel.scan 不够（那是纯函数，本来就对）：真会坏的是
         // ①轮询压根没跑 ②窗口认错了人、只在 onAppear 刷了一次 ③把录制中的 0 字节临时件也列出来。
@@ -3998,6 +4006,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if let s = pbBefore { pb.setString(s, forType: .string) }
         }
 
+        // 这条用例除了「主菜单里有编辑项」那三条，其余全靠真按 ⌘V/⌘C/⌘A ——
+        // 而没有前台就没有 key 窗，按键就没处落。锁屏的会话里先问一句，别红着冤枉人。
+        if frontReachable == nil {
+            reachFront { [weak self] ok in
+                guard let self else { return }
+                self.frontReachable = ok
+                if ok { self.runEditTest(retry: retry) } else {
+                    self.sayCannotReachFront(0, 0, "按 ⌘V / ⌘C / ⌘A 的 8 步")
+                }
+            }
+            return
+        }
+
         // ① 结构：主菜单里得有「编辑」，四项快捷键都得在。少了这份菜单，下面全都白搭
         let edit = NSApp.mainMenu?.items.compactMap(\.submenu).first { $0.title == "编辑" }
         if retry == 0 {
@@ -4200,6 +4221,342 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         tick()
     }
 
+    /// 富文本验收（`WECAL_RICH_TEST=1`）。
+    ///
+    /// 分两段是有意的：属性、洗白、RTF 往返、store 落盘这些是纯逻辑，不该被「窗口有没有
+    /// 前台」拖下水；而「⌘B 真变粗」「⌘Z 真能撤」「粘进来真被洗白」必须在真窗口里按，
+    /// 否则只验了函数、没验接线。前半永远跑，后半跟着窗口走。
+    ///
+    /// 跑法同 `WECAL_EDIT_TEST`：**必须** `open -n --stdout … --env`，
+    /// 且必须配 `WECAL_NOTES_DIR=<临时目录>`（它会真的往 rich/ 里写文件）。
+    private func runRichTest(retry: Int = 0, pass p0: Int = 0, fail f0: Int = 0) {
+        var pass = p0, fail = f0
+        func check(_ ok: Bool, _ label: String) {
+            say(ok ? "  ✓ \(label)" : "  ✗ \(label)")
+            if ok { pass += 1 } else { fail += 1 }
+        }
+        func done() {
+            say("== 结果：\(pass) 通过 / \(fail) 失败 ==")
+            exit(fail == 0 ? 0 : 1)
+        }
+        guard let notesDir = ProcessInfo.processInfo.environment["WECAL_NOTES_DIR"], !notesDir.isEmpty else {
+            say("  ✗ 这个用例必须配 WECAL_NOTES_DIR=<临时目录> 跑：它会往 rich/ 里真写 rtf")
+            say("== 结果：0 通过 / 1 失败 ==")
+            exit(1)
+        }
+        func attrs(_ s: NSAttributedString, _ i: Int) -> [NSAttributedString.Key: Any] {
+            s.attributes(at: min(i, max(0, s.length - 1)), effectiveRange: nil)
+        }
+        func fontOf(_ d: [NSAttributedString.Key: Any]) -> NSFont? { d[.font] as? NSFont }
+
+        if retry == 0 {
+            say("== 富文本用例 ==")
+
+            // ⓪ 结构：「格式」菜单得挂着，五个快捷键得在。和正文那半分开——
+            //    这一条不需要窗口、不需要前台，锁屏也照样能验；而「⌘B 真变粗」需要。
+            //    拆开之后，红了能一眼分出「菜单没挂」还是「窗不在场」。
+            let fmt = NSApp.mainMenu?.items.compactMap(\.submenu).first { $0.title == "格式" }
+            check(fmt != nil, "主菜单里有「格式」子菜单")
+            if let fmt {
+                let pairs = fmt.items.map { ($0.title, $0.keyEquivalent) }
+                let want: [(String, String)] = [
+                    ("粗体", "b"), ("斜体", "i"), ("下划线", "u"), ("删除线", "X"), ("清除格式", "\\"),
+                ]
+                let missing = want.filter { p in !pairs.contains { $0.0 == p.0 && $0.1 == p.1 } }
+                check(missing.isEmpty,
+                      "五项格式快捷键都挂上了（⌘B ⌘I ⌘U ⇧⌘X ⌘\\）\(missing.isEmpty ? "" : "· 缺 \(missing.map(\.0))")")
+                check(fmt.items.allSatisfy { $0.target === self },
+                      "动作都指向 AppDelegate（这几件事 NSTextView 的响应链里没有现成动作）")
+            }
+
+            // ① 老笔记（只有纯文本）要能原样长成富文本
+            let plain = RichText.attributed(fromPlain: "第一段\n第二段")
+            check(plain.string == "第一段\n第二段", "纯文本能长成富文本（一个字都不动）")
+            let pf = fontOf(attrs(plain, 0))
+            check(pf.map { abs($0.pointSize - RichText.baseSize) < 0.01 && !RichText.isBold($0) } ?? false,
+                  "默认是正文档、不加粗（老笔记上来不该突然变样）")
+
+            // ② 四种行内格式 + 清除
+            var d = RichText.baseAttributes()
+            d = RichText.style(.bold, onto: d)
+            check(fontOf(d).map(RichText.isBold) ?? false, "加粗：字体真的带上 bold")
+            d = RichText.style(.italic, onto: d)
+            check(fontOf(d).map(RichText.isItalic) ?? false, "斜体：字体真的带上 italic")
+            d = RichText.style(.underline, onto: d)
+            check((d[.underlineStyle] as? Int ?? 0) != 0, "下划线：下划线属性真的在")
+            d = RichText.style(.strike, onto: d)
+            check((d[.strikethroughStyle] as? Int ?? 0) != 0, "删除线：删除线属性真的在")
+            d = RichText.style(.clear, onto: d)
+            check(!(fontOf(d).map(RichText.isBold) ?? true)
+                    && (d[.underlineStyle] as? Int ?? 0) == 0
+                    && (d[.strikethroughStyle] as? Int ?? 0) == 0
+                    && abs((fontOf(d)?.pointSize ?? 0) - RichText.baseSize) < 0.01,
+                  "清除格式：四个样式全掉、回到正文档")
+
+            // ③ 字号只走台阶，且不会缩没
+            var big = RichText.baseAttributes()
+            big = RichText.style(.bigger, onto: big)
+            big = RichText.style(.bigger, onto: big)
+            check(abs((fontOf(big)?.pointSize ?? 0) - 21) < 0.01, "字号走台阶：14 → 17 → 21")
+            var small = RichText.baseAttributes()
+            for _ in 0..<8 { small = RichText.style(.smaller, onto: small) }
+            check(abs((fontOf(small)?.pointSize ?? 0) - 11) < 0.01, "字号到底停在 11，不会缩成看不清的小字")
+
+            // ④ 颜色只有四档：白字（深色主题里粘来的）必须归墨，否则在宣纸底上看不见
+            check(RichText.nearestColor(.white) == RichPalette.ink, "粘进来的白字归墨色")
+            check(RichText.nearestColor(NSColor(srgbRed: 0.88, green: 0.16, blue: 0.06, alpha: 1)) == RichPalette.red,
+                  "接近正红的归到红档（不会留成一个野生色值）")
+
+            // ⑤ 洗白：外来 40pt + 白字 + 深灰底 → 台阶顶 / 墨色 / 无底
+            let foreign = NSAttributedString(string: "外来正文", attributes: [
+                .font: NSFont.systemFont(ofSize: 40),
+                .foregroundColor: NSColor.white,
+                .backgroundColor: NSColor.darkGray,
+            ])
+            let clean = RichText.launder(foreign)
+            let cf = fontOf(attrs(clean, 0))
+            check(abs((cf?.pointSize ?? 0) - 26) < 0.01, "洗白：40pt 吸附到台阶顶 26")
+            check((attrs(clean, 0)[.foregroundColor] as? NSColor) == RichPalette.ink,
+                  "洗白：白字洗成墨色")
+            check(attrs(clean, 0)[.backgroundColor] == nil, "洗白：外来的深灰底丢掉")
+
+            // ⑥ 图片附件不能被洗进正文（图走图片条，进正文会把落盘和搜索一起带坏）
+            let withImg = NSMutableAttributedString(string: "文字")
+            withImg.append(NSAttributedString(attachment: NSTextAttachment()))
+            withImg.append(NSAttributedString(string: "结尾"))
+            check(RichText.launder(withImg).string == "文字结尾", "洗白：图片附件不进正文")
+
+            // ⑦ RTF 往返：只粗三个字，回来还得只粗那三个字
+            let rich = NSMutableAttributedString(string: "粗的这段", attributes: RichText.baseAttributes())
+            rich.setAttributes(RichText.style(.bold, onto: RichText.baseAttributes()),
+                              range: NSRange(location: 0, length: 2))
+            if let data = RichText.rtfData(rich), let back = RichText.attributed(fromRTF: data) {
+                check(back.string == "粗的这段", "RTF 往返：文本一致")
+                check(fontOf(attrs(back, 0)).map(RichText.isBold) ?? false, "RTF 往返：粗体还在")
+                check(!(fontOf(attrs(back, 3)).map(RichText.isBold) ?? true), "RTF 往返：没选中的那半没被带粗")
+            } else {
+                check(false, "RTF 往返：转不出来")
+            }
+
+            // ⑧ store：落盘 / 重启后还在 / 纯文本写回作废 / 删笔记连带删 rtf
+            let ns = self.notes
+            ns.selected = nil
+            ns.add(folder: false)
+            guard let id = ns.selected else {
+                check(false, "建不出一条测试笔记，后面的落盘断言没法做")
+                done()
+                return
+            }
+            let body = NSMutableAttributedString(string: "落盘测试", attributes: RichText.baseAttributes())
+            body.setAttributes(RichText.style(.bold, onto: RichText.baseAttributes()),
+                               range: NSRange(location: 0, length: 2))
+            ns.setRichBody(id, body)
+            ns.saveNow()
+            guard let rtfURL = ns.richURL(id) else {
+                check(false, "拿不到 rtf 路径")
+                done()
+                return
+            }
+            check(FileManager.default.fileExists(atPath: rtfURL.path), "富文本真写成 rich/<id>.rtf")
+            check(ns.node(id)?.body == "落盘测试", "body 同步成纯文本投影（搜索和字数靠它）")
+
+            let again = NoteStore()
+            again.configure(projectDir: nil)   // 目录同样来自 WECAL_NOTES_DIR：等于「重启一次」
+            let reloaded = again.attributed(id)
+            check(reloaded.string == "落盘测试", "重载后文本一致")
+            check(fontOf(attrs(reloaded, 0)).map(RichText.isBold) ?? false, "重载后粗体还在")
+
+            again.setBody(id, "改成纯文本")
+            check(!FileManager.default.fileExists(atPath: rtfURL.path),
+                  "写纯文本会把 rtf 删掉（否则界面还显示旧的富文本）")
+
+            again.setRichBody(id, RichText.attributed(fromPlain: "再写回富文本"))
+            check(FileManager.default.fileExists(atPath: rtfURL.path), "还能再写回 rtf")
+            again.remove(id)
+            check(!FileManager.default.fileExists(atPath: rtfURL.path), "删笔记连带删掉 rtf")
+        }
+
+        if retry == 0 {
+            // ⑨ 回写判据。这段判断错了不是「看起来有点不对」，是整扇记事本窗顶到 100% CPU：
+            //    2026-11-25 真实翻车 —— 拿 `textStorage.isEqual(to: text)` 当判据，而
+            //    带 `NSTextList` 的段落样式（项目符号）会被文本系统规范化，比出来永远 false，
+            //    于是每次视图更新都回写、回写动选择、刷新工具条又发通知，自己喂自己。
+            let same1 = RichText.attributed(fromPlain: "同一份")
+            let same2 = RichText.attributed(fromPlain: "同一份")
+            let other = RichText.attributed(fromPlain: "别人改的")
+            check(!RichEditor.shouldPush(applied: same1, incoming: same2, editing: false),
+                  "推过的那一份不再推（换了个对象实例也算同一份）")
+            check(!RichEditor.shouldPush(applied: same1, incoming: other, editing: true),
+                  "正在这里打字时，外来内容不抢（抢了光标会跳、输入法会断）")
+            check(RichEditor.shouldPush(applied: same1, incoming: other, editing: false),
+                  "没在打字、内容真变了 → 推")
+            check(RichEditor.shouldPush(applied: nil, incoming: same1, editing: false),
+                  "还没有快照（刚开窗）→ 推")
+
+            // ⑩ 格式命令认谁：只有「记事本窗是 key 窗 + 焦点是正文编辑器」才吃。
+            //    少了后半句，搜索框那根 field editor 也会被喂成粗体。
+            let fakeTV = RichTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
+            let fieldEditor = NSTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 20))
+            let notesWin = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+                                    styleMask: [.borderless], backing: .buffered, defer: true)
+            let otherWin = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+                                    styleMask: [.borderless], backing: .buffered, defer: true)
+            check(Self.formatTarget(key: notesWin, notes: notesWin, firstResponder: fakeTV) === fakeTV,
+                  "记事本窗是 key、焦点在正文 → 吃")
+            check(Self.formatTarget(key: notesWin, notes: notesWin, firstResponder: fieldEditor) == nil,
+                  "记事本窗是 key 但焦点在搜索框（field editor）→ 不吃，免得把搜索词变粗")
+            check(Self.formatTarget(key: otherWin, notes: notesWin, firstResponder: fakeTV) == nil,
+                  "key 窗是别的窗 → 不吃")
+            check(Self.formatTarget(key: nil, notes: notesWin, firstResponder: fakeTV) == nil,
+                  "没有 key 窗（锁屏 / 应用在后台）→ 不吃，不应该猜")
+        }
+
+        // ---- 下面这段要真窗口：按 ⌘B / ⌘Z / ⌘V 看正文实际变成什么样 ----
+        // 先确认这个会话能把 app 带到前台（锁屏时不能）。抢不到就只交代前半截跑完了多少，
+        // 别让四条红冒充「功能坏了」。判据与说明都在 `reachFront` / `sayCannotReachFront`。
+        if frontReachable == nil {
+            reachFront { [weak self] ok in
+                guard let self else { return }
+                self.frontReachable = ok
+                if ok {
+                    // retry 传 1：纯逻辑那 25 条已经跑过，不再重跑（pass/fail 带着走）
+                    self.runRichTest(retry: 1, pass: pass, fail: fail)
+                } else {
+                    self.sayCannotReachFront(pass, fail, "「真按 ⌘B / ⌘Z / ⌘V」4 步")
+                }
+            }
+            return
+        }
+        let p = openFeature(.notes)
+        guard let tv = Self.findTextView(p.contentView) as? RichTextView else {
+            if retry < 12 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                    self?.runRichTest(retry: retry + 1, pass: pass, fail: fail)
+                }
+                return
+            }
+            say("  ✗ 找不到记事本正文（连试 12 次）· 笔记目录 \(notesDir)")
+            done()
+            return
+        }
+        // 和 `WECAL_EDIT_TEST` 一样先把场地摆一次（真到位的判定在第一步里反复补刀）：
+        // 正文拿不到焦点的话，SwiftUI 会把用例设进去的字当成「外部改的」再写回去。
+        p.makeKeyAndOrderFront(nil)
+        p.makeFirstResponder(tv)
+        say("  开窗后立刻：记事本窗 isKey=\(p.isKeyWindow) · app isActive=\(NSApp.isActive) · 笔记目录 \(notesDir)")
+        let pb = NSPasteboard.general
+        let pbBefore = pb.string(forType: .string)
+        func key(_ ch: String, code: UInt16, win: NSWindow) -> NSEvent? {
+            NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command],
+                             timestamp: ProcessInfo.processInfo.systemUptime,
+                             windowNumber: win.windowNumber, context: nil,
+                             characters: ch, charactersIgnoringModifiers: ch,
+                             isARepeat: false, keyCode: code)
+        }
+        func press(_ ch: String, _ code: UInt16) {
+            if let e = key(ch, code: code, win: p) { NSApp.sendEvent(e) }
+        }
+        func isBoldAt(_ i: Int) -> Bool {
+            guard let st = tv.textStorage, st.length > 0 else { return false }
+            return fontOf(st.attributes(at: min(i, st.length - 1), effectiveRange: nil)).map(RichText.isBold) ?? false
+        }
+
+        var steps: [(label: String, budget: Double, act: () -> Void, ask: () -> String?)] = []
+
+        func premise() -> String {
+            "窗isKey=\(p.isKeyWindow) · app活跃=\(NSApp.isActive) · "
+                + "第一响应者=\(p.firstResponder.map { String(describing: type(of: $0)) } ?? "nil")"
+        }
+
+        // ⚠️ 这一条比 `WECAL_EDIT_TEST` 那版严一档：除了「窗是 key、app 活跃」，还要求
+        // 「焦点在正文上」。第一版漏了后半句，结果后面三条连着红 —— 因为正文不是第一响应者，
+        // SwiftUI 的 `updateNSView` 认为「外部改了内容」就把草稿回写，用例刚设进去的字
+        // 下一帧就被换回笔记原文（表现是「正文是 落盘测试」）。窗口不是 key、粘不进来，
+        // 也都是同一个根：按键分发到的是 key 窗的响应链，链头不是这个文本视图。
+        steps.append(("前提：记事本窗是 key、app 活跃、焦点在正文", 10, {}, {
+            if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+            if !p.isKeyWindow { p.makeKeyAndOrderFront(nil) }
+            if !p.isKeyWindow { p.makeKey() }   // nonactivating 面板拿 key 的正路，不带动 app
+            if !p.isKeyWindow { return "记事本窗不是 key 窗 · \(premise())" }
+            if p.firstResponder !== tv { p.makeFirstResponder(tv) }
+            if p.firstResponder !== tv { return "焦点不在正文 · \(premise())" }
+            return NSApp.isActive ? "" : "app 在后台（isActive=false）→ 菜单不参与按键分发"
+        }))
+
+        // 「⌘B 真变粗了」这件事有没有发生过 —— 拉这一根线是为了挡住 ⌘Z 那条的假绿：
+        // 正文本来就不粗时，「撤销之后不粗」照样成立，于是它会在上一步失败的情况下绿着。
+        var bolded = false
+        steps.append(("⌘B 只把选中的三个字变粗", 5, {
+            tv.string = "第一段\n第二段"
+            tv.setSelectedRange(NSRange(location: 0, length: 3))
+            press("b", 11)
+        }, {
+            guard tv.string.hasPrefix("第一段") else { return "正文是 \(tv.string.debugDescription)" }
+            if !isBoldAt(0) { return "选中那段没变粗" }
+            if isBoldAt(4) { return "没选中的第二段也被带粗了" }
+            bolded = true
+            return ""
+        }))
+
+        steps.append(("⌘Z 能撤回刚才那次格式", 5, {
+            press("z", 6)
+        }, {
+            if !bolded { return "上一步没真变粗，这步撤不撤看不出区别（不许空过）" }
+            return isBoldAt(0) ? "撤销之后还是粗的" : ""
+        }))
+
+        steps.append(("⌘V 粘外来富文本 → 字号与颜色都被洗过", 6, {
+            let foreign = NSAttributedString(string: "外来", attributes: [
+                .font: NSFont.systemFont(ofSize: 40),
+                .foregroundColor: NSColor.white,
+                .backgroundColor: NSColor.darkGray,
+            ])
+            pb.clearContents()
+            if let d = try? foreign.data(from: NSRange(location: 0, length: foreign.length),
+                                         documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]) {
+                pb.setData(d, forType: .rtf)
+            }
+            tv.string = ""
+            tv.setSelectedRange(NSRange(location: 0, length: 0))
+            press("v", 9)
+        }, {
+            guard tv.string.hasPrefix("外来") else { return "正文是 \(tv.string.debugDescription)" }
+            let d = attrs(tv.textStorage ?? NSAttributedString(), 0)
+            let size = fontOf(d)?.pointSize ?? 0
+            if abs(size - 26) > 0.01 { return "字号是 \(size)，没吸附到 26" }
+            return (d[.foregroundColor] as? NSColor) == RichPalette.ink ? "" : "颜色没洗成墨色"
+        }))
+
+        var idx = 0
+        var started = false
+        var deadline = Date()
+        func tick() {
+            guard idx < steps.count else {
+                tv.string = ""
+                pb.clearContents()
+                if let s = pbBefore { pb.setString(s, forType: .string) }
+                done()
+                return
+            }
+            if !started {
+                steps[idx].act()
+                started = true
+                deadline = Date().addingTimeInterval(steps[idx].budget)
+            }
+            if let why = steps[idx].ask() {
+                check(why.isEmpty, why.isEmpty ? steps[idx].label : "\(steps[idx].label)：\(why)")
+                idx += 1
+                started = false
+            } else if Date() > deadline {
+                check(false, "\(steps[idx].label) —— 等不到（超过 \(Int(steps[idx].budget)) 秒）")
+                idx += 1
+                started = false
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { tick() }
+        }
+        tick()
+    }
+
     /// 找某个占位符的输入框（SwiftUI 的 TextField 落下来就是 NSTextField）
     static func findField(_ v: NSView?, placeholder: String) -> NSTextField? {
         guard let v else { return nil }
@@ -4356,6 +4713,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    // MARK: - 真窗口用例的前提：这个会话能不能把 app 带到前台
+
+    /// 结果缓存一次：两个走按键的用例（`WECAL_EDIT_TEST` / `WECAL_RICH_TEST`）共用，
+    /// 也都是递归重试进来的，不该每重试一次就反复试两秒。
+    private var frontReachable: Bool?
+
+    /// 「能不能让 app 变活跃、让窗口变 key」——**锁屏时不能**。
+    ///
+    /// 锁屏的会话里没有前台可言：`NSApp.activate` 没有效果，`nonactivatingPanel` 也拿不到
+    /// key，于是「按一遍 ⌘B / ⌘V 看正文变成什么样」这一整段根本无从验起。2026-11-25
+    /// 就在锁屏状态下白查了一轮：四条红看着像接线断了，其实是这台机器的屏锁着。
+    ///
+    /// 判据故意用**事实**（反复 activate 两秒还是 isActive=false），不去猜原因：
+    /// 读 `CGSSessionCopyCurrentDictionary` 是私有 API，`ioreg` 又要额外权限，
+    /// 而这里只关心一件事 —— 现在能不能演。
+    private func reachFront(_ done: @escaping (Bool) -> Void) {
+        var tries = 0
+        func attempt() {
+            if NSApp.isActive { done(true); return }
+            NSApp.activate(ignoringOtherApps: true)
+            tries += 1
+            if tries >= 9 { done(NSApp.isActive); return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { attempt() }
+        }
+        attempt()
+    }
+
+    /// 抢不到前台时统一说这几句：是「没验」，不是「坏了」。
+    ///
+    /// ⚠️ 失败数必须照实往外传：第一版这里写死了 `0 失败`，结果对抗对照（把 `launder`
+    /// 改成恒等，准时红掉 4 条）报出来的仍是「24 通过 / 0 失败」—— 跳过分支一开口
+    /// 就把真红吞了。锁屏是常态（这台机器常锁着），所以这条口径比平时更要紧。
+    private func sayCannotReachFront(_ pass: Int, _ fail: Int, _ skipped: String) {
+        say("  ▶ 抢不到前台（activate 试了 2 秒，app isActive 仍是 false）")
+        say("    最常见的原因是这个会话锁着屏：锁屏时任何 app 都成不了 active、窗口也成不了 key，")
+        say("    所以要用 key 窗响应链的那几步（\(skipped)）在这里没法验。")
+        say("    这不等于功能坏了 —— 解锁后在桌面会话里重跑一次才算数。")
+        say("== 结果：\(pass) 通过 / \(fail) 失败（\(skipped)未跑）==")
+        exit(fail == 0 ? 0 : 1)
+    }
+
     /// 哪扇窗变 key 时该把整个 app 抢到前台 —— 只有记事本。单独拎成纯判断是为了能验：
     /// 「只认记事本、别的窗都不抢」这件事写成一行比对就没法测了。
     /// `notes == nil`（记事本窗还没开或已销毁）一律不抢。
@@ -4439,8 +4837,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = edit
 
+        // 「格式」同样不是装饰：记事本正文的富文本快捷键也注册在这几项上。
+        // 动作落在 AppDelegate 而不是 target=nil：这几件事 AppKit 没有现成的标准动作
+        // （删除线、清除格式都不在 NSTextView 的响应链里），自己接一条最省事。
+        let fmtItem = NSMenuItem()
+        main.addItem(fmtItem)
+        let fmt = NSMenu(title: "格式")
+        for (title, sel, key) in [
+            ("粗体", #selector(formatBold(_:)), "b"),
+            ("斜体", #selector(formatItalic(_:)), "i"),
+            ("下划线", #selector(formatUnderline(_:)), "u"),
+            ("删除线", #selector(formatStrike(_:)), "X"),
+            ("清除格式", #selector(formatClear(_:)), "\\"),
+        ] {
+            let it = fmt.addItem(withTitle: title, action: sel, keyEquivalent: key)
+            if key == "X" { it.keyEquivalentModifierMask = [.command, .shift] }
+            it.target = self
+        }
+        fmtItem.submenu = fmt
+
         NSApp.mainMenu = main
     }
+
+    // MARK: 格式菜单
+
+    /// 这些动作只认记事本窗里的正文编辑器。
+    /// 为什么是这个守卫：搜索框的编辑器（field editor）也是 NSTextView，不认窗口
+    /// 就会把搜索词变成粗体 —— 看不出来，但是另一回事。`RichTextView` 这个类型
+    /// 本身就排除了所有单行 field editor。
+    ///
+    /// 抽成纯函数是为了能离屏断言「谁有资格吃格式命令」：锁屏时窗口成不了 key，
+    /// 按键那半验不了，但这半（认不认人）同样是错一次就变成「搜索词变粗」的坑。
+    nonisolated static func formatTarget(key: NSWindow?, notes: NSWindow?,
+                                        firstResponder: NSResponder?) -> RichTextView? {
+        guard let key, let notes, key === notes else { return nil }
+        return firstResponder as? RichTextView
+    }
+
+    private func formatOp(_ op: RichOp) {
+        let notes = featurePanel(.notes)
+        guard let tv = Self.formatTarget(key: NSApp.keyWindow, notes: notes,
+                                         firstResponder: notes?.firstResponder) else { return }
+        RichText.apply(op, to: tv)
+    }
+
+    @objc private func formatBold(_ sender: Any?) { formatOp(.bold) }
+    @objc private func formatItalic(_ sender: Any?) { formatOp(.italic) }
+    @objc private func formatUnderline(_ sender: Any?) { formatOp(.underline) }
+    @objc private func formatStrike(_ sender: Any?) { formatOp(.strike) }
+    @objc private func formatClear(_ sender: Any?) { formatOp(.clear) }
 
     /// 用 ⌘Tab 或点程序坞切回本应用时，把最小化/隐藏的窗口唤回
     func applicationDidBecomeActive(_ notification: Notification) {

@@ -38,12 +38,16 @@ struct NotePanel: View {
     /// 编辑区草稿。不直接绑 store 里的字段：每敲一个字都写 @Published 会让整棵树重排，
     /// 光标还容易跳。这里先攒着，停手 0.5 秒再回写。
     @State private var draftTitle = ""
+    /// 正文（带格式）。`draftBody` 只是它的纯文本投影，用来数字数、做回写时的兜底
+    @State private var draftRich = RichText.attributed(fromPlain: "")
     @State private var draftBody = ""
     /// 草稿属于哪个节点。切选中前必须靠它把字存回原来那条，否则刚打的就丢了
     @State private var draftFor: String?
     /// 正在用 loadDraft 灌值：这期间的 onChange 不算用户输入
     @State private var loading = false
     @State private var saveTask: Task<Void, Never>?
+    /// 格式工具条 ↔ 文本视图的那根线（按钮要知道当前光标上是什么格式）
+    @StateObject private var rich = RichEditorBridge()
 
     @State private var renaming: String?
     @State private var renameText = ""
@@ -80,7 +84,12 @@ struct NotePanel: View {
                 if let n = pendingDelete {
                     commit(true)
                     notes.remove(n.id)
-                    if draftFor == n.id { draftFor = nil; draftTitle = ""; draftBody = "" }
+                    if draftFor == n.id {
+                        draftFor = nil
+                        draftTitle = ""
+                        draftBody = ""
+                        draftRich = RichText.attributed(fromPlain: "")
+                    }
                 }
                 pendingDelete = nil
             }
@@ -488,20 +497,140 @@ struct NotePanel: View {
                 .padding(.horizontal, PZ(12))
                 .padding(.top, PZ(6))
 
-            TextEditor(text: $draftBody)
-                .font(PF(11))
-                .foregroundColor(Theme.ink)
-                .scrollContentBackground(.hidden)
-                .background(Color.clear)
-                .padding(.horizontal, PZ(8))
-                .padding(.vertical, PZ(4))
-                .frame(maxHeight: .infinity)
-                .onChange(of: draftBody) { _ in commit(false) }
+            formatBar
+
+            RichEditor(noteID: n.id, text: draftRich, bridge: rich) { attr in
+                draftRich = attr
+                draftBody = attr.string
+                commit(false)
+            }
+            .padding(.horizontal, PZ(8))
+            .padding(.vertical, PZ(4))
+            .frame(maxHeight: .infinity)
 
             if !n.images.isEmpty { imageStrip(n) }
             editorToolbar(n)
         }
         .onChange(of: draftTitle) { _ in commit(false) }
+    }
+
+    /// 正文上方那一条格式栏。
+    /// 为什么放「上方」而不是沉底：写字的人是先选格式再打字，跟眼下这条工具条——
+    /// 贴图和删除——的使用时机不一样，混在一排会互相干扰。
+    private var formatBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: PZ(3)) {
+                formatButton(.bold, "B", font: PF(11.5, .bold, .serif), tip: "粗体 ⌘B")
+                formatButton(.italic, "I", font: PF(11.5, .regular, .serif).italic(), tip: "斜体 ⌘I")
+                formatButton(.underline, "U", font: PF(11.5, .regular), tip: "下划线 ⌘U", underline: true)
+                formatButton(.strike, "S", font: PF(11.5, .regular), tip: "删除线 ⇧⌘X", strike: true)
+
+                barDivider
+
+                stepButton("textformat.size.smaller", "小一点") { rich.apply(.smaller) }
+                Text("\(Int(rich.size))")
+                    .font(PF(9, .semibold, .rounded))
+                    .foregroundColor(Theme.inkSoft)
+                    .frame(minWidth: PZ(15))
+                stepButton("textformat.size.larger", "大一点") { rich.apply(.bigger) }
+
+                barDivider
+
+                ForEach(RichPalette.textColors, id: \.name) { item in
+                    Button { rich.setColor(item.color) } label: {
+                        Circle()
+                            .fill(Color(nsColor: item.color))
+                            .frame(width: PZ(10), height: PZ(10))
+                            .overlay(
+                                Circle().stroke(Theme.ink.opacity(isSameColor(item.color) ? 0.55 : 0.12),
+                                                lineWidth: isSameColor(item.color) ? 1.4 : 0.7)
+                            )
+                            .frame(width: PZ(15), height: PZ(15))
+                    }
+                    .buttonStyle(.plain)
+                    .help("\(item.name)色")
+                }
+
+                Button { rich.toggleHighlight() } label: {
+                    Image(systemName: "highlighter")
+                        .font(PF(9, .semibold))
+                        .foregroundColor(rich.highlighted ? Theme.sched : Theme.inkSoft)
+                        .frame(width: PZ(15), height: PZ(15))
+                        .background(
+                            RoundedRectangle(cornerRadius: PZ(3), style: .continuous)
+                                .fill(rich.highlighted ? Color(nsColor: RichPalette.highlight) : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+                .help("高亮")
+
+                barDivider
+
+                formatButton(.bullet, "•", font: PF(12, .bold), tip: "项目符号")
+
+                stepButton("eraser", "清除格式") { rich.apply(.clear) }
+            }
+            .padding(.horizontal, PZ(12))
+            .padding(.vertical, PZ(3))
+        }
+        .frame(height: PZ(21))
+    }
+
+    private var barDivider: some View {
+        Rectangle()
+            .fill(Theme.sched.opacity(0.12))
+            .frame(width: 0.8, height: PZ(11))
+            .padding(.horizontal, PZ(1.5))
+    }
+
+    private func isSameColor(_ c: NSColor) -> Bool {
+        let a = rich.color.usingColorSpace(.sRGB), b = c.usingColorSpace(.sRGB)
+        guard let a, let b else { return false }
+        return abs(a.redComponent - b.redComponent) < 0.04
+            && abs(a.greenComponent - b.greenComponent) < 0.04
+            && abs(a.blueComponent - b.blueComponent) < 0.04
+    }
+
+    private func formatButton(_ op: RichOp, _ label: String, font: Font,
+                              tip: String, underline: Bool = false,
+                              strike: Bool = false) -> some View {
+        let on = rich.active.contains(op)
+        return Button { rich.apply(op) } label: {
+            Text(label)
+                .font(font)
+                .foregroundColor(on ? .white : Theme.ink)
+                .frame(width: PZ(17), height: PZ(16))
+                .background(
+                    RoundedRectangle(cornerRadius: PZ(4), style: .continuous)
+                        .fill(on ? AnyShapeStyle(Theme.redGradient) : AnyShapeStyle(Color.clear))
+                )
+                .overlay(
+                    Text(label)
+                        .font(font)
+                        .foregroundColor(.clear)
+                        .overlay(alignment: .bottom) {
+                            if underline || strike {
+                                Rectangle()
+                                    .fill(on ? Color.white : Theme.ink)
+                                    .frame(height: 0.8)
+                                    .offset(y: strike ? PZ(-4) : 0)
+                            }
+                        }
+                )
+        }
+        .buttonStyle(.plain)
+        .help(tip)
+    }
+
+    private func stepButton(_ icon: String, _ tip: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(PF(9, .semibold))
+                .foregroundColor(Theme.inkSoft)
+                .frame(width: PZ(16), height: PZ(16))
+        }
+        .buttonStyle(.plain)
+        .help(tip)
     }
 
     private func imageStrip(_ n: NoteNode) -> some View {
@@ -621,7 +750,8 @@ struct NotePanel: View {
         draftFor = notes.selected
         let n = notes.selectedNode
         draftTitle = n?.title ?? ""
-        draftBody = n?.body ?? ""
+        draftRich = n.map { notes.attributed($0.id) } ?? RichText.attributed(fromPlain: "")
+        draftBody = draftRich.string
         loading = false
     }
 
@@ -631,18 +761,18 @@ struct NotePanel: View {
         guard !loading, let id = draftFor else { return }
         let ns = notes
         let t = draftTitle
-        let b = draftBody
+        let richText = draftRich
         saveTask?.cancel()
         if immediate {
             ns.rename(id, to: t)
-            ns.setBody(id, b)
+            ns.setRichBody(id, richText)
             return
         }
         saveTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 500_000_000)
             guard !Task.isCancelled else { return }
             ns.rename(id, to: t)
-            ns.setBody(id, b)
+            ns.setRichBody(id, richText)
         }
     }
 
@@ -684,5 +814,176 @@ struct NotePanel: View {
             )
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - 富文本编辑器（NSTextView 包装）
+
+/// SwiftUI 的 `TextEditor` 只接 `String`，富文本必须自己接一层 NSTextView。
+/// 这里只借它的能力（选区、属性、撤销），可能坏事的东西全关掉：
+/// 智能引号/自动替换会把代码片段和英文改坏；图片导入会把正文变成附件仓库
+/// —— 记事本的图走底下那条图片条，不进正文（否则导出、备份、搜索全要跟着改）。
+final class RichTextView: NSTextView {
+    /// 粘贴先过一遍洗白。从浏览器/微信粘一段带格式的文字，原样插进来会带上
+    /// 22.5pt 的字号、行距 0、深色主题的白字 —— 在宣纸底上直接看不清。
+    /// 图片不走这里：⌘V 贴图在按键层就被监视器拦下，存进图片条了。
+    override func paste(_ sender: Any?) {
+        guard let raw = RichTextView.attributedFromPasteboard(.general) else {
+            super.paste(sender)
+            return
+        }
+        RichText.insert(RichText.launder(raw), into: self)
+    }
+
+    /// 只认「真的是富文本」的两种类型。纯文本让它走系统那条路，
+    /// 免得我们自己拼字符串时把换行、制表符处理错。
+    static func attributedFromPasteboard(_ pb: NSPasteboard) -> NSAttributedString? {
+        if let d = pb.data(forType: .rtf),
+           let s = try? NSAttributedString(
+               data: d,
+               options: [.documentType: NSAttributedString.DocumentType.rtf],
+               documentAttributes: nil) {
+            return s
+        }
+        if let d = pb.data(forType: .html),
+           let s = try? NSAttributedString(
+               data: d,
+               options: [.documentType: NSAttributedString.DocumentType.html],
+               documentAttributes: nil) {
+            return s
+        }
+        return nil
+    }
+}
+
+
+struct RichEditor: NSViewRepresentable {
+    /// 哪一篇。换笔记必须整份换内容，不能靠「内容相等」去猜
+    let noteID: String
+    let text: NSAttributedString
+    let bridge: RichEditorBridge
+    let onChange: (NSAttributedString) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    /// 该不该把 `incoming` 再推一次进文本视图。
+    ///
+    /// 抽成纯函数是为了能离屏断言：这段判断写错不是「看着有点不对」，是**整扇窗卡死**。
+    /// 2026-11-25 就是这么翻的：拿 `textStorage.isEqual(to: text)` 当判据，而
+    /// `NSTextStorage` 会把带 `NSTextList` 的段落样式（项目符号）规范化一遍 ——
+    /// 比出来永远是 false → 每次视图更新都回写 → 回写动选择 → `refresh()` 发布 →
+    /// 又一轮更新。**任何带项目符号的笔记都会把主线程顶到 100% CPU**。
+    /// 所以判据换成「模型侧快照」：`applied` 是我们上次推下去的那一份，比它即可。
+    static func shouldPush(applied: NSAttributedString?, incoming: NSAttributedString, editing: Bool) -> Bool {
+        if let applied, applied.isEqual(to: incoming) { return false }
+        // 用户正在这里打字：外来的内容一律不抢（抢了光标会跳、输入法会被打断）
+        if editing { return false }
+        return true
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: RichEditor
+        var boundID: String
+        /// 程序化灌值期间不把变化报回去 —— 否则一换笔记就等于「用户刚打了一段」
+        var loading = false
+        /// 上一次推给文本视图的那一份（模型侧，不是文本视图里的实际状态）。
+        /// 别改成「从 textStorage 读回来存」：那份已经被文本系统改写过，存了也白存。
+        var applied: NSAttributedString?
+
+        init(_ p: RichEditor) {
+            parent = p
+            boundID = p.noteID
+        }
+
+        func textDidChange(_ note: Notification) {
+            guard !loading, let tv = note.object as? NSTextView, let st = tv.textStorage else { return }
+            parent.onChange(NSAttributedString(attributedString: st))
+            parent.bridge.refresh()
+        }
+
+        func textViewDidChangeSelection(_ note: Notification) {
+            parent.bridge.refresh()
+        }
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+
+        let tv = RichTextView(frame: .zero)
+        tv.delegate = context.coordinator
+        tv.isRichText = true
+        tv.allowsUndo = true
+        tv.importsGraphics = false
+        tv.drawsBackground = false
+        tv.isEditable = true
+        tv.isSelectable = true
+        // 自动那几样一律关掉：中文写作里「自动替换」只会把人惹毛
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.isAutomaticTextReplacementEnabled = false
+        tv.isAutomaticSpellingCorrectionEnabled = false
+        tv.isContinuousSpellCheckingEnabled = false
+        tv.isGrammarCheckingEnabled = false
+        tv.textContainerInset = NSSize(width: 6, height: 4)
+        tv.typingAttributes = RichText.baseAttributes()
+        tv.minSize = NSSize(width: 0, height: 0)
+        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.autoresizingMask = [.width]
+        tv.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        tv.textContainer?.widthTracksTextView = true
+        scroll.documentView = tv
+
+        context.coordinator.loading = true
+        tv.textStorage?.setAttributedString(text)
+        tv.setSelectedRange(NSRange(location: 0, length: 0))
+        context.coordinator.applied = text
+        context.coordinator.loading = false
+        // 别在视图构建/更新中间改 @Published：下一个主线程回合再挂，
+        // 否则控制台会刷「Modifying state during view update」那一类告警。
+        DispatchQueue.main.async { bridge.attach(tv) }
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let tv = scroll.documentView as? RichTextView else { return }
+        context.coordinator.parent = self
+
+        if context.coordinator.boundID != noteID {
+            context.coordinator.boundID = noteID
+            context.coordinator.loading = true
+            tv.textStorage?.setAttributedString(text)
+            tv.typingAttributes = RichText.baseAttributes()
+            tv.setSelectedRange(NSRange(location: 0, length: 0))
+            tv.undoManager?.removeAllActions()
+            tv.scrollToBeginningOfDocument(nil)
+            context.coordinator.applied = text
+            context.coordinator.loading = false
+            DispatchQueue.main.async { bridge.attach(tv) }
+            return
+        }
+
+        // 同一篇：只有「外部真的换了内容」才推回视图。判据见 `shouldPush` ——
+        // ⚠️ 不要改回 `textStorage.isEqual(to: text)`：项目符号那类段落样式会被文本系统
+        // 规范化，比出来永远 false，于是每次视图更新都回写，整扇窗顶到 100% CPU。
+        let editing = tv.window?.firstResponder === tv
+        guard Self.shouldPush(applied: context.coordinator.applied, incoming: text, editing: editing),
+              let st = tv.textStorage else { return }
+        context.coordinator.loading = true
+        let sel = tv.selectedRange()
+        st.setAttributedString(text)
+        // 只在选区真要被收拢时才动它：`setSelectedRange` 会发一条选择变化通知，
+        // 那又会把工具条刷一遍，白添一轮视图更新。
+        let loc = min(sel.location, st.length)
+        if sel.length > 0 || sel.location != loc {
+            tv.setSelectedRange(NSRange(location: loc, length: 0))
+        }
+        context.coordinator.applied = text
+        context.coordinator.loading = false
     }
 }

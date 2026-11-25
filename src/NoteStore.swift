@@ -90,6 +90,11 @@ final class NoteStore: ObservableObject {
 
     private(set) var dir: URL?
     private var imageDir: URL?
+    /// 富文本按篇存成 RTF：`data/notes/rich/<id>.rtf`。
+    /// 为什么不塞进 notes.json：RTF 是二进制味的转义文本，一篇几百行的话整份 JSON
+    /// 会变成没法读、也没法手改的糊状；分文件之后「删笔记」就是删两个文件，
+    /// 而且 rtf 坏了只影响那一篇，不会把整棵树带下水。
+    private var richDir: URL?
     private var saveTask: Task<Void, Never>?
     private var cache: [String: NSImage] = [:]
     private var configured = false
@@ -112,6 +117,8 @@ final class NoteStore: ObservableObject {
         }
         imageDir = dir?.appendingPathComponent("images", isDirectory: true)
         if let d = imageDir { try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
+        richDir = dir?.appendingPathComponent("rich", isDirectory: true)
+        if let d = richDir { try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
         load()
         seedIfEmpty()
         // 进来不该是空白的：默认选中第一篇，省掉「先点一下」这一步
@@ -308,9 +315,48 @@ final class NoteStore: ObservableObject {
         scheduleSave()
     }
 
-    /// 正文由视图那边防抖后调过来，每敲一个字都落盘太浪费
+    /// 正文由视图那边防抖后调过来，每敲一个字都落盘太浪费。
+    /// 注意：这是「纯文本」入口 —— 写进来就等于宣告这一篇没有格式，
+    /// 配套的 rtf 会被删掉，否则界面上会继续显示旧的富文本（body 才是新内容）。
+    /// 带格式的回写走 `setRichBody`。
     func setBody(_ id: String, _ text: String) {
         guard let i = nodes.firstIndex(where: { $0.id == id }), nodes[i].body != text else { return }
+        nodes[i].body = text
+        nodes[i].updatedAt = Date().timeIntervalSince1970
+        if let u = richURL(id) { try? FileManager.default.removeItem(at: u) }
+        scheduleSave()
+    }
+
+    // MARK: 富文本
+
+    func richURL(_ id: String) -> URL? { richDir?.appendingPathComponent(id + ".rtf") }
+
+    /// 取一篇笔记的正文（带格式）。老笔记没有 rtf 文件，就按 body 现造一份 ——
+    /// 这样升级上来不用做批量迁移，打开哪篇就顺手把哪篇接上，没打开过的原样躺着。
+    func attributed(_ id: String) -> NSAttributedString {
+        guard let n = node(id) else { return RichText.attributed(fromPlain: "") }
+        if n.folder { return RichText.attributed(fromPlain: "") }
+        if let u = richURL(id), let d = try? Data(contentsOf: u),
+           let s = RichText.attributed(fromRTF: d) {
+            return s
+        }
+        return RichText.attributed(fromPlain: n.body)
+    }
+
+    /// 带格式回写：rtf 落盘 + body 存纯文本投影（搜索、字数、老的兼容路径都看 body）。
+    /// 内容全空的时候把 rtf 删掉，不留一堆只有属性没有字的空壳文件。
+    func setRichBody(_ id: String, _ attr: NSAttributedString) {
+        guard let i = nodes.firstIndex(where: { $0.id == id }) else { return }
+        let text = attr.string
+        if let u = richURL(id) {
+            if let d = RichText.rtfData(attr) {
+                // 内容没变就别重写（防抖每次都来，磁盘不必陪着抖）
+                if (try? Data(contentsOf: u)) != d { try? d.write(to: u, options: .atomic) }
+            } else {
+                try? FileManager.default.removeItem(at: u)
+            }
+        }
+        guard nodes[i].body != text else { return }
         nodes[i].body = text
         nodes[i].updatedAt = Date().timeIntervalSince1970
         scheduleSave()
@@ -320,6 +366,7 @@ final class NoteStore: ObservableObject {
         let ids = subtree(id)
         for n in nodes where ids.contains(n.id) {
             for img in n.images { deleteImageFile(img) }
+            if let u = richURL(n.id) { try? FileManager.default.removeItem(at: u) }
         }
         nodes.removeAll { ids.contains($0.id) }
         expanded.subtract(ids)
