@@ -79,7 +79,35 @@ _CLI_EXTRA_DIRS = [
     "/opt/homebrew/bin",
 ]
 
-_cli_cache = {"path": None, "env": None}
+_cli_cache = {"path": None, "env": None, "proxy_off": None}
+
+# ⚠️ 环境代理会把企业微信 API 拖死（2026-11-25 排查了两小时）：
+# 本机 GUI 会话被 `launchctl setenv` 注入了 http(s)_proxy=127.0.0.1:9098（给 xray/云梯
+# 这类不读系统代理的 Rust/Electron 应用用的）。云梯一没开，9098 上没人监听，而 CLI
+# 的请求层认这几个变量 → 每个调用 0.1 秒内失败：
+#   893101 Request failed: error sending request for url (https://qyapi.weixin.qq.com/...)
+# 表现出来就是「待办改名 / 改时间 / 删除全失败」+「日程一直沿用上次数据」。
+# 企业微信 API 全在境内、直连就行，所以子进程一律不带代理变量。
+# 真要经代理出网（极少见），设 WECOM_CLI_KEEP_PROXY=1 保留原样。
+_PROXY_KEYS = ("http_proxy", "https_proxy", "all_proxy")
+
+
+def _cli_env():
+    """给 wecom-cli 的干净环境：补全 PATH，并默认摘掉环境代理。"""
+    env = os.environ.copy()
+    if os.environ.get("WECOM_CLI_KEEP_PROXY", "") != "1":
+        dropped = {}
+        for k in list(env):
+            if k.lower() in _PROXY_KEYS:
+                dropped[k] = env.pop(k)
+        if dropped:
+            # 保险绳：个别请求层优先看 NO_PROXY，给它一个「全都不走代理」
+            env["NO_PROXY"] = env["no_proxy"] = "*"
+            _cli_cache["proxy_off"] = dropped.get("https_proxy") or dropped.get("HTTPS_PROXY") or "环境代理"
+    extra = [d for d in _cli_dirs()]
+    if extra:
+        env["PATH"] = os.pathsep.join(extra) + os.pathsep + env.get("PATH", "")
+    return env
 
 
 def _version_bins(root):
@@ -110,10 +138,7 @@ def resolve_cli():
     if _cli_cache["path"] is not None:
         return _cli_cache["path"]
 
-    env = os.environ.copy()
-    extra = [d for d in _cli_dirs()]
-    if extra:
-        env["PATH"] = os.pathsep.join(extra) + os.pathsep + env.get("PATH", "")
+    env = _cli_env()
 
     explicit = os.environ.get("WECOM_CLI", "")
     if explicit and os.path.isfile(explicit) and os.access(explicit, os.X_OK):
@@ -173,7 +198,11 @@ def run_cli(args, timeout=90):
 
     errcode = obj.get("errcode", 0)
     if errcode not in (0, None):
-        raise WecomError(errcode, obj.get("errmsg", ""), obj.get("help_message", ""))
+        errmsg = obj.get("errmsg", "")
+        # 网络类失败且本轮摘过代理：把这件事写进错误文案，省得下次又怀疑是代理
+        if _cli_cache["proxy_off"] and "error sending request" in errmsg:
+            errmsg = "%s（本次已绕过环境代理 %s，仍是网络问题）" % (errmsg, _cli_cache["proxy_off"])
+        raise WecomError(errcode, errmsg, obj.get("help_message", ""))
 
     results = obj.get("results_json")
     if isinstance(results, str):
@@ -460,5 +489,64 @@ def main():
     return 0 if not errors else 2
 
 
+def net_env_selftest():
+    """WECAL_NET_ENV_TEST=1：不联网，只验「子进程环境里不许带代理」这条规矩。
+    踩过的坑：GUI 会话被 launchctl setenv 注入 http(s)_proxy=127.0.0.1:9098，云梯一没开，
+    书办的每一次读写都在 0.1 秒内失败（893101 error sending request）。"""
+    ok = fail = 0
+
+    def check(name, cond):
+        nonlocal ok, fail
+        if cond:
+            ok += 1
+            print("  ✓ %s" % name)
+        else:
+            fail += 1
+            print("  ✗ %s" % name)
+
+    saved = dict(os.environ)
+
+    def restore():
+        os.environ.clear()
+        os.environ.update(saved)
+
+    try:
+        os.environ["http_proxy"] = os.environ["https_proxy"] = "http://127.0.0.1:9098"
+        os.environ["HTTPS_PROXY"] = "http://127.0.0.1:9098"
+        os.environ["ALL_PROXY"] = "http://127.0.0.1:9098"
+        os.environ.pop("WECOM_CLI_KEEP_PROXY", None)
+        _cli_cache["proxy_off"] = None
+        env = _cli_env()
+        low = {k.lower() for k in env}
+        check("默认摘掉 http/https/all 代理（大小写都摘）",
+              not ({"http_proxy", "https_proxy", "all_proxy"} & low))
+        check("摘过代理时补一道 NO_PROXY=*", env.get("NO_PROXY") == "*" and env.get("no_proxy") == "*")
+        check("记下方才摘掉的代理（出错时写进提示）",
+              _cli_cache["proxy_off"] == "http://127.0.0.1:9098")
+        check("PATH 仍然补全（别把老坑改回来）",
+              os.path.expanduser("~/.workbuddy/binaries/node/cli-connector-packages/bin")
+              in env.get("PATH", ""))
+        os.environ["WECOM_CLI_KEEP_PROXY"] = "1"
+        env2 = _cli_env()
+        check("WECOM_CLI_KEEP_PROXY=1 时原样保留（企业内网出口留的口子）",
+              env2.get("https_proxy") == "http://127.0.0.1:9098")
+        restore()
+        os.environ.pop("http_proxy", None)
+        os.environ.pop("https_proxy", None)
+        os.environ.pop("HTTPS_PROXY", None)
+        os.environ.pop("ALL_PROXY", None)
+        os.environ.pop("WECOM_CLI_KEEP_PROXY", None)
+        env3 = _cli_env()
+        check("环境本来没代理时不乱加 NO_PROXY",
+              "NO_PROXY" not in env3 and "no_proxy" not in env3)
+    finally:
+        restore()
+
+    print("净环境自检 %d 通过 / %d 失败" % (ok, fail))
+    return 0 if fail == 0 else 1
+
+
 if __name__ == "__main__":
+    if os.environ.get("WECAL_NET_ENV_TEST") == "1":
+        sys.exit(net_env_selftest())
     sys.exit(main())
