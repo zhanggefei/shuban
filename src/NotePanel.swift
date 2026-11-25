@@ -69,13 +69,19 @@ struct NotePanel: View {
             .frame(maxHeight: .infinity)
             footer
         }
-        .overlay(preview)
-        .onAppear { loadDraft() }
+        .onAppear {
+            loadDraft()
+            // 让按键层（⌘V 贴图）能找到正文：见 NoteStore.richBridge
+            notes.richBridge = rich
+        }
         .onChange(of: notes.selected) { _ in
             commit(true)
             loadDraft()
         }
-        .onDisappear { commit(true) }
+        .onDisappear {
+            commit(true)
+            if notes.richBridge === rich { notes.richBridge = nil }
+        }
         .alert("删除这一项？", isPresented: Binding(
             get: { pendingDelete != nil },
             set: { if !$0 { pendingDelete = nil } }
@@ -107,7 +113,10 @@ struct NotePanel: View {
                 ? "「\(n.title)」里面还有 \(sub) 项，会一起删掉，不能撤销。"
                 : "「\(n.title)」是个空文件夹，删掉不能撤销。"
         }
-        return "「\(n.title)」会连同 \(n.images.count) 张图一起删掉，不能撤销。"
+        let imgs = notes.imageCount(n.id)
+        return imgs > 0
+            ? "「\(n.title)」会连同正文里的 \(imgs) 张图一起删掉，不能撤销。"
+            : "「\(n.title)」删掉不能撤销。"
     }
 
     // MARK: - 头部
@@ -154,7 +163,7 @@ struct NotePanel: View {
                         Image(systemName: "list.bullet.indent")
                             .font(PF(8.5, .semibold))
                             .foregroundColor(Theme.sched.opacity(0.75))
-                        Text("\(notes.noteCount) 篇 · 树形目录 · 可贴图")
+                        Text("\(notes.noteCount) 篇 · 树形目录 · 可插图和文件")
                             .font(PF(10)).foregroundColor(Theme.inkSoft).lineLimit(1)
                     }
                 }
@@ -325,11 +334,6 @@ struct NotePanel: View {
                     .font(PF(8, .semibold, .rounded))
                     .foregroundColor(on ? Theme.sched.opacity(0.8) : Theme.inkSoft.opacity(0.7))
             }
-            if !n.folder && !n.images.isEmpty {
-                Image(systemName: "photo")
-                    .font(.system(size: PZ(7)))
-                    .foregroundColor(Theme.todo.opacity(0.9))
-            }
         }
         .padding(.horizontal, PZ(4))
         .frame(height: PZ(21))
@@ -499,16 +503,16 @@ struct NotePanel: View {
 
             formatBar
 
-            RichEditor(noteID: n.id, text: draftRich, bridge: rich) { attr in
+            RichEditor(noteID: n.id, text: draftRich, bridge: rich,
+                       onOpenFile: { notes.openFile($0) }) { attr in
                 draftRich = attr
-                draftBody = attr.string
+                draftBody = RichText.plain(attr)
                 commit(false)
             }
             .padding(.horizontal, PZ(8))
             .padding(.vertical, PZ(4))
             .frame(maxHeight: .infinity)
 
-            if !n.images.isEmpty { imageStrip(n) }
             editorToolbar(n)
         }
         .onChange(of: draftTitle) { _ in commit(false) }
@@ -633,52 +637,15 @@ struct NotePanel: View {
         .help(tip)
     }
 
-    private func imageStrip(_ n: NoteNode) -> some View {
-        // 读一下 galleryTick：NSImage 不是值类型，删图后不靠这个 tick 视图不会重取
-        let tick = notes.galleryTick
-        return ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: PZ(5)) {
-                ForEach(n.images, id: \.self) { name in
-                    ZStack(alignment: .topTrailing) {
-                        if let img = notes.image(name) {
-                            Image(nsImage: img)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: PZ(54), height: PZ(40))
-                                .clipped()
-                                .clipShape(RoundedRectangle(cornerRadius: PZ(5), style: .continuous))
-                                .overlay(RoundedRectangle(cornerRadius: PZ(5), style: .continuous)
-                                    .stroke(Theme.sched.opacity(0.18), lineWidth: 0.8))
-                                .onTapGesture { notes.previewImage = name }
-                        }
-                        Button { notes.removeImage(name, from: n.id) } label: {
-                            ZStack {
-                                Circle().fill(Theme.redDeep).frame(width: PZ(10), height: PZ(10))
-                                Image(systemName: "xmark")
-                                    .font(.system(size: PZ(5.5), weight: .bold))
-                                    .foregroundColor(.white)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .help("删掉这张图")
-                        .offset(x: PZ(3), y: PZ(-3))
-                    }
-                }
-            }
-            .padding(.horizontal, PZ(12))
-            .padding(.vertical, PZ(4))
-        }
-        .frame(height: PZ(52))
-        .id("\(n.id)-\(tick)")
-        .overlay(alignment: .top) {
-            Rectangle().fill(Theme.sched.opacity(0.08)).frame(height: 0.8)
-        }
-    }
-
+    /// 底部这条只干三件事：插图片、插文件、删笔记。
+    ///
+    /// 为什么不再有「下面那条图片条」：插图本来就该跟文字在一起（选中、删除、撤销
+    /// 都和字一样），单独一条挂在正文底下，写作时要来回看两处才知道这篇有什么。
     private func editorToolbar(_ n: NoteNode) -> some View {
         HStack(spacing: PZ(6)) {
-            ghost("贴图", "photo.on.rectangle.angled") { pickImages() }
-            Text("⌘V 也能直接贴")
+            ghost("插图片", "photo.on.rectangle.angled") { pickImages() }
+            ghost("插文件", "paperclip") { pickFiles() }
+            Text("⌘V 直接贴图 / 拖文字")
                 .font(PF(8))
                 .foregroundColor(Theme.inkSoft.opacity(0.75))
             Spacer(minLength: 0)
@@ -689,32 +656,6 @@ struct NotePanel: View {
         .background(Theme.cream.opacity(0.85))
         .overlay(alignment: .top) {
             Rectangle().fill(Theme.sched.opacity(0.08)).frame(height: 0.8)
-        }
-    }
-
-    // MARK: - 图片放大
-
-    @ViewBuilder
-    private var preview: some View {
-        if let name = notes.previewImage, let img = notes.image(name) {
-            ZStack(alignment: .topTrailing) {
-                Color.black.opacity(0.55)
-                Image(nsImage: img)
-                    .resizable()
-                    .interpolation(.high)
-                    .scaledToFit()
-                    .padding(PZ(16))
-                Button { notes.previewImage = nil } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(PF(15))
-                        .foregroundColor(.white.opacity(0.9))
-                }
-                .buttonStyle(.plain)
-                .padding(PZ(8))
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { notes.previewImage = nil }
-            .transition(.opacity)
         }
     }
 
@@ -751,7 +692,7 @@ struct NotePanel: View {
         let n = notes.selectedNode
         draftTitle = n?.title ?? ""
         draftRich = n.map { notes.attributed($0.id) } ?? RichText.attributed(fromPlain: "")
-        draftBody = draftRich.string
+        draftBody = RichText.plain(draftRich)
         loading = false
     }
 
@@ -776,8 +717,10 @@ struct NotePanel: View {
         }
     }
 
-    // MARK: - 贴图
+    // MARK: - 插图 / 插文件
 
+    /// 选图片插到光标处。落点由 `rich.textView` 的选区决定 —— 也就是说「点一下正文
+    /// 想去的位置，再点插图片」，图就长在那儿，而不是永远堆在末尾。
     private func pickImages() {
         NSApp.activate(ignoringOtherApps: true)
         let p = NSOpenPanel()
@@ -785,12 +728,36 @@ struct NotePanel: View {
         p.canChooseDirectories = false
         p.canChooseFiles = true
         p.allowedContentTypes = [.image]
-        p.prompt = "贴进来"
-        p.message = "选一张或多张图片贴到当前笔记"
+        p.prompt = "插进来"
+        p.message = "选一张或多张图片插到正文光标处"
         guard p.runModal() == .OK else { return }
-        var n = 0
-        for u in p.urls where notes.addImage(u) { n += 1 }
-        if n == 0 { notes.setStatus("这些文件不算图片") }
+        var ok = 0
+        for u in p.urls {
+            guard let img = NSImage(contentsOf: u), let png = img.shubanPNG(),
+                  rich.insertImage(png) else { continue }
+            ok += 1
+        }
+        notes.setStatus(ok > 0 ? "已插入 \(ok) 张图" : "这些文件读不成图片")
+    }
+
+    /// 选文件：实体拷进 data/notes/files/，正文里只留一个可点开的芯片。
+    /// 不限类型 —— 客户现场拍的照、别人发的 pdf、要贴进周报的 xlsx 都往里放，
+    /// 记事本的价值就在于「不用先去想它该存哪」。
+    private func pickFiles() {
+        NSApp.activate(ignoringOtherApps: true)
+        let p = NSOpenPanel()
+        p.allowsMultipleSelection = true
+        p.canChooseDirectories = false
+        p.canChooseFiles = true
+        p.prompt = "插进来"
+        p.message = "选文件插到正文光标处（原文件会被拷进笔记目录）"
+        guard p.runModal() == .OK else { return }
+        var ok = 0
+        for u in p.urls {
+            guard let name = notes.addFile(u), rich.insertFile(name) else { continue }
+            ok += 1
+        }
+        if ok == 0 && notes.status.isEmpty { notes.setStatus("没插进来") }
     }
 
     // MARK: - 通用件
@@ -821,18 +788,66 @@ struct NotePanel: View {
 
 /// SwiftUI 的 `TextEditor` 只接 `String`，富文本必须自己接一层 NSTextView。
 /// 这里只借它的能力（选区、属性、撤销），可能坏事的东西全关掉：
-/// 智能引号/自动替换会把代码片段和英文改坏；图片导入会把正文变成附件仓库
-/// —— 记事本的图走底下那条图片条，不进正文（否则导出、备份、搜索全要跟着改）。
+/// 智能引号/自动替换会把代码片段和英文改坏；链接自动识别会把「2026.11.25」变成链接。
+///
+/// 正文里的非文字内容有两种，脾气完全不同（规矩写在 `NoteAttachment` 头上）：
+/// 图是 `NSTextAttachment`，跟着字走；文件是一段带 `shuban-file://` 链接的芯片。
 final class RichTextView: NSTextView {
-    /// 粘贴先过一遍洗白。从浏览器/微信粘一段带格式的文字，原样插进来会带上
-    /// 22.5pt 的字号、行距 0、深色主题的白字 —— 在宣纸底上直接看不清。
-    /// 图片不走这里：⌘V 贴图在按键层就被监视器拦下，存进图片条了。
+    /// 链接（文件芯片、网页链接）显示成什么样。
+    ///
+    /// ⚠️ 必须自己指定：`NSTextView` 自带一份 `linkTextAttributes`（含系统蓝），
+    /// 它**盖在**段落属性上面 —— 芯片里给的金色会被它盖掉，显示成一枚蓝链接
+    ///（README 图里就是这么翻的车）。做成静态量是为了用例能对着真窗口核对一遍。
+    static let linkAttributes: [NSAttributedString.Key: Any] = [
+        .foregroundColor: RichPalette.gold,
+        .underlineStyle: NSUnderlineStyle.single.rawValue,
+    ]
+
+    /// 点到文件芯片时回调（由 NotePanel 拿去开 data/notes/files/ 里的实体）
+    var onOpenFile: ((String) -> Void)?
+
+    /// 粘贴。三条路按「更像用户想要什么」排：
+    /// ① 剪贴板里是位图 → 变成正文里的图（限宽、转 PNG）；
+    /// ② 是 RTF/HTML → 洗白后插进光标处；
+    /// ③ 都不是 → 交给系统贴纯文本。
+    ///
+    /// ①在这里也做一遍，是因为 ⌘V 那条路在按键层就被监视器拦了一道（见
+    /// `AppDelegate.installPasteMonitor`），而右键菜单、`paste:` 动作不经过监视器 ——
+    /// 两处都要能贴图，不然同一个 ⌘V 会有「有时贴、有时不贴」这种查不动的表现。
     override func paste(_ sender: Any?) {
+        if let img = NoteStore.imageFromPasteboard(), let png = img.shubanPNG() {
+            RichText.insert(NoteAttachment.line(png) ?? NSAttributedString(), into: self)
+            return
+        }
         guard let raw = RichTextView.attributedFromPasteboard(.general) else {
             super.paste(sender)
             return
         }
         RichText.insert(RichText.launder(raw), into: self)
+    }
+
+    /// 点芯片。editable 的文本视图里，普通点击是「放光标」，链接默认只有 ⌘ 点才跟 ——
+    /// 可是芯片是个「东西」不是一段文字，让人先按 ⌘ 再点很别扭，所以在 mouseDown 里
+    /// 自己认一道：落在芯片上就打开并吞掉这一下（不让光标跳进芯片中间）。
+    /// `clickedOnLink` 那条路留着，⌘ 点和系统的行为就不冲突。
+    override func mouseDown(with event: NSEvent) {
+        if let url = linkAtPoint(of: event),
+           let name = NoteAttachment.fileName(from: url) {
+            onOpenFile?(name)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    /// 点击位置落在哪个链接上（不在任何链接上返回 nil）
+    private func linkAtPoint(of event: NSEvent) -> URL? {
+        guard let lm = layoutManager, let tc = textContainer, let storage = textStorage else { return nil }
+        let p = convert(event.locationInWindow, from: nil)
+        let origin = textContainerOrigin
+        let idx = lm.characterIndex(for: NSPoint(x: p.x - origin.x, y: p.y - origin.y),
+                                    in: tc, fractionOfDistanceBetweenInsertionPoints: nil)
+        guard idx >= 0, idx < storage.length else { return nil }
+        return storage.attribute(.link, at: idx, effectiveRange: nil) as? URL
     }
 
     /// 只认「真的是富文本」的两种类型。纯文本让它走系统那条路，
@@ -862,6 +877,8 @@ struct RichEditor: NSViewRepresentable {
     let noteID: String
     let text: NSAttributedString
     let bridge: RichEditorBridge
+    /// 点到正文里的文件芯片（`shuban-file://`）时交出去 —— 开文件是 store 的事
+    var onOpenFile: (String) -> Void = { _ in }
     let onChange: (NSAttributedString) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -904,6 +921,20 @@ struct RichEditor: NSViewRepresentable {
         func textViewDidChangeSelection(_ note: Notification) {
             parent.bridge.refresh()
         }
+
+        /// ⌘ 点链接走这条（普通点芯片在 `RichTextView.mouseDown` 里就吃了）。
+        /// 只认两种：我们自己的文件芯片、http/https 网页。别的 scheme 一律不跟 ——
+        /// 正文里点一下就能开任何东西，不合适。
+        func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+            guard let url = link as? URL else { return false }
+            if let name = NoteAttachment.fileName(from: url) {
+                parent.onOpenFile(name)
+                return true
+            }
+            guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
+            NSWorkspace.shared.open(url)
+            return true
+        }
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -913,11 +944,24 @@ struct RichEditor: NSViewRepresentable {
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
 
+        let coord = context.coordinator
         let tv = RichTextView(frame: .zero)
-        tv.delegate = context.coordinator
+        tv.delegate = coord
         tv.isRichText = true
         tv.allowsUndo = true
+        // 图只从「插图片 / ⌘V / 粘贴」三个入口进正文，都要过 `NoteAttachment.image`
+        // （限宽 520、统一转 PNG）。开着 importsGraphics 的话，随手拖一张几兆的
+        // 原图进来就是一个不受控的 tiff 附件，包体积和排版都会失控。
         tv.importsGraphics = false
+        // 走 coordinator 而不是直接抓住 self：`parent` 每次 updateNSView 都会刷新，
+        // 抓住make 时那一份的话，日后换的回调就是空转
+        tv.onOpenFile = { [weak coord] name in coord?.parent.onOpenFile(name) }
+        // 自动识别链接会把「2026.11.25」「10.0.0.1」变成链接，正文里凭空多出能点的东西
+        tv.isAutomaticLinkDetectionEnabled = false
+        // ⚠️ 必须自己指定链接色。`NSTextView` 自带一份 linkTextAttributes（3 项，含系统蓝），
+        // 它**盖在**段落属性上面：芯片里我们给的是金色，显示出来却是系统蓝
+        //（README 图里那枚蓝色芯片就是这么来的）。这里钉成金色，和工具条那档一致。
+        tv.linkTextAttributes = RichTextView.linkAttributes
         tv.drawsBackground = false
         tv.isEditable = true
         tv.isSelectable = true

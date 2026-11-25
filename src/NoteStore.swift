@@ -7,8 +7,11 @@
 //  落盘成 JSON 也天然是稳定结构，不会因为层级深了出现递归解码的坑。
 //  取树的时候按 parent 现算，节点量级（几十上百）完全撑得住。
 //
-//  存储位置：<项目>/data/notes/notes.json + data/notes/images/<uuid>.png
-//  纯本地、纯明文，随手 cp 走就能备份。
+//  存储位置（全部在 data/notes/ 下，纯本地、随手 cp 走就能备份）：
+//    notes.json          树（扁平表 + parent 指针）+ 正文的纯文本投影
+//    rich/<id>.rtfd/     正文的富文本，RTFD 目录包 —— 正文里的图就装在包里的 Attachment.png
+//    files/<文件名>      正文里「插文件」拷进来的附件（芯片指向这里）
+//    images/<uuid>.png   老数据：这一轮之前图是正文下面一条图片条，打开时自动迁进正文
 //
 
 import SwiftUI
@@ -24,7 +27,9 @@ struct NoteNode: Codable, Identifiable, Equatable {
     /// true = 文件夹（能装子项），false = 笔记（有正文和图片）
     var folder: Bool
     var body: String
-    /// 图片文件名，实际文件在 data/notes/images/ 下
+    /// ⚠️ 老字段，只为把老数据读出来。这一轮之前图存在正文**下方**一条图片条里，
+    /// 靠这个列表挂账；现在图直接进正文，所以打开时会迁进 RTFD 包并把这里清空。
+    /// 别再往里加东西 —— 新图走 `RichEditorBridge.insertImage`。
     var images: [String]
     /// 同一层内的排序
     var order: Int
@@ -83,20 +88,30 @@ final class NoteStore: ObservableObject {
     /// 搜索词；非空时列表切成「全库搜索结果」
     @Published var keyword: String = ""
     @Published private(set) var status: String = ""
-    /// 正在放大预览的图片文件名；nil = 没开预览
-    @Published var previewImage: String?
-    /// 图库变了就自增，逼缩略图重取（NSImage 不是值类型，不加这个不会刷新）
-    @Published private(set) var galleryTick = 0
 
     private(set) var dir: URL?
-    private var imageDir: URL?
-    /// 富文本按篇存成 RTF：`data/notes/rich/<id>.rtf`。
-    /// 为什么不塞进 notes.json：RTF 是二进制味的转义文本，一篇几百行的话整份 JSON
-    /// 会变成没法读、也没法手改的糊状；分文件之后「删笔记」就是删两个文件，
-    /// 而且 rtf 坏了只影响那一篇，不会把整棵树带下水。
+    /// 富文本按篇存成 RTFD 包：`data/notes/rich/<id>.rtfd/`。
+    ///
+    /// 为什么不塞进 notes.json：一篇带图的正文是个目录包（TXT.rtf + 几 MB 的 png），
+    /// 编码成 JSON 就成了没法读、没法手改、也没法单独备份的糊状。分文件之后
+    /// 「删笔记」就是删一个目录，而且包坏了只影响那一篇，不会把整棵树带下水。
     private var richDir: URL?
+    /// 「插文件」拷进来的附件实体：`data/notes/files/`。正文里只有一个芯片指过来。
+    ///
+    /// ⚠️ 文件**不**进 RTFD 包：自动保存是 0.7 秒防抖，一个几十兆的 ppt 进了包，
+    /// 就是每写一句话重写几十兆（写一次卡一次）。
+    private var filesDir: URL?
+    /// 老数据里的图（正文下面那条图片条）就放在这儿，迁移完就不再用了
+    private var imageDir: URL?
+    /// 正文编辑器的桥（工具条、⌘V 贴图都从这里插进光标处）。
+    /// 为什么挂在 store 上而不是让按键监视器自己找 firstResponder：正文是 SwiftUI
+    /// 里包的 NSTextView，「当前是哪一篇、光标在哪」只有面板自己和它知道；
+    /// 而且搜索框底下也是 NSTextView（field editor），按类名去找很容易把图贴进搜索框。
+    weak var richBridge: RichEditorBridge?
+    /// 每篇正文上次落盘时的指纹。RTFD 是目录包，写一次就是一整包（含图），
+    /// 防抖每次都会来，内容没变就别陪着抖。
+    private var richSig: [String: String] = [:]
     private var saveTask: Task<Void, Never>?
-    private var cache: [String: NSImage] = [:]
     private var configured = false
 
     /// 目录最多几层。够用就行，纯为了保护「拖进自己子目录」之外的手滑
@@ -119,8 +134,11 @@ final class NoteStore: ObservableObject {
         if let d = imageDir { try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
         richDir = dir?.appendingPathComponent("rich", isDirectory: true)
         if let d = richDir { try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
+        filesDir = dir?.appendingPathComponent("files", isDirectory: true)
+        if let d = filesDir { try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
         load()
         seedIfEmpty()
+        migrateLegacyImages()
         // 进来不该是空白的：默认选中第一篇，省掉「先点一下」这一步
         if selected == nil { selected = firstNoteId() }
         // 验收钩子：按标题预选一条，拍图时不用手点
@@ -192,9 +210,12 @@ final class NoteStore: ObservableObject {
 
             · 左上角「＋」新建笔记，「夹」新建文件夹 —— 都建在当前选中的那一层里
             · 条目可以拖动：拖到文件夹上就进去，拖到笔记上就排在它前面
-            · 正文里直接 ⌘V 贴图，也可以点下面「贴图」按钮选文件
+            · 正文里直接 ⌘V 贴图；也可以点下面「插图片」「插文件」选文件
+            · 图就在文字中间，和字一起选中、一起删除、一起撤销；
+              文件在正文里是一个 📄 芯片，点一下就打开
+            · 上面那条格式栏：粗体斜体下划线删除线、字号台阶、四种颜色、项目符号
             · 右键条目：重命名 / 删除 / 上移下移 / 移到顶层
-            · 全部存在本机 data/notes/ 下，是纯 JSON，拷走就是备份
+            · 全部存在本机 data/notes/ 下，是纯 JSON 加一个 <id>.rtfd 包，拷走就是备份
 
             这个页面就是拿来放零碎东西的：客户现场记的几句话、一张截图、
             待会儿要贴到周报里的一段结论。不用管格式，写完切回日历就行。
@@ -317,62 +338,228 @@ final class NoteStore: ObservableObject {
 
     /// 正文由视图那边防抖后调过来，每敲一个字都落盘太浪费。
     /// 注意：这是「纯文本」入口 —— 写进来就等于宣告这一篇没有格式，
-    /// 配套的 rtf 会被删掉，否则界面上会继续显示旧的富文本（body 才是新内容）。
+    /// 配套的富文本包会被删掉，否则界面上会继续显示旧的富文本（body 才是新内容）。
     /// 带格式的回写走 `setRichBody`。
     func setBody(_ id: String, _ text: String) {
         guard let i = nodes.firstIndex(where: { $0.id == id }), nodes[i].body != text else { return }
         nodes[i].body = text
         nodes[i].updatedAt = Date().timeIntervalSince1970
-        if let u = richURL(id) { try? FileManager.default.removeItem(at: u) }
+        dropRich(id)
         scheduleSave()
     }
 
     // MARK: 富文本
 
-    func richURL(_ id: String) -> URL? { richDir?.appendingPathComponent(id + ".rtf") }
+    /// 富文本包：`rich/<id>.rtfd/`
+    func richURL(_ id: String) -> URL? { richDir?.appendingPathComponent(id + ".rtfd") }
+    /// 上一版的纯 RTF（带不了图）。只为让这一轮之前存的笔记还能读出来，不再写它。
+    func legacyRichURL(_ id: String) -> URL? { richDir?.appendingPathComponent(id + ".rtf") }
 
-    /// 取一篇笔记的正文（带格式）。老笔记没有 rtf 文件，就按 body 现造一份 ——
+    /// 取一篇笔记的正文（带格式）。老笔记没有富文本包，就按 body 现造一份 ——
     /// 这样升级上来不用做批量迁移，打开哪篇就顺手把哪篇接上，没打开过的原样躺着。
     func attributed(_ id: String) -> NSAttributedString {
-        guard let n = node(id) else { return RichText.attributed(fromPlain: "") }
-        if n.folder { return RichText.attributed(fromPlain: "") }
-        if let u = richURL(id), let d = try? Data(contentsOf: u),
-           let s = RichText.attributed(fromRTF: d) {
+        guard let n = node(id), !n.folder else { return RichText.attributed(fromPlain: "") }
+        if let u = richURL(id), let w = try? FileWrapper(url: u, options: []),
+           let s = RichText.attributed(fromRTFD: w) {
+            return s
+        }
+        // 这一轮之前的存档是单个 .rtf 文件（正文里的图存不住，只有字和格式）
+        if let u = legacyRichURL(id), let d = try? Data(contentsOf: u),
+           let s = RichText.attributed(fromLegacyRTF: d) {
             return s
         }
         return RichText.attributed(fromPlain: n.body)
     }
 
-    /// 带格式回写：rtf 落盘 + body 存纯文本投影（搜索、字数、老的兼容路径都看 body）。
-    /// 内容全空的时候把 rtf 删掉，不留一堆只有属性没有字的空壳文件。
+    /// 带格式回写：RTFD 包落盘 + body 存纯文本投影（搜索、字数、老的兼容路径都看 body）。
+    /// 内容全空的时候把包删掉，不留一堆只有属性没有字的空壳目录。
     func setRichBody(_ id: String, _ attr: NSAttributedString) {
         guard let i = nodes.firstIndex(where: { $0.id == id }) else { return }
-        let text = attr.string
-        if let u = richURL(id) {
-            if let d = RichText.rtfData(attr) {
-                // 内容没变就别重写（防抖每次都来，磁盘不必陪着抖）
-                if (try? Data(contentsOf: u)) != d { try? d.write(to: u, options: .atomic) }
-            } else {
-                try? FileManager.default.removeItem(at: u)
-            }
-        }
+        writeRich(id, attr)
+        let text = RichText.plain(attr)
         guard nodes[i].body != text else { return }
         nodes[i].body = text
         nodes[i].updatedAt = Date().timeIntervalSince1970
         scheduleSave()
     }
 
+    /// 正文里现在有几张图（删除确认那句话要用）
+    func imageCount(_ id: String) -> Int {
+        let s = attributed(id)
+        var n = 0
+        s.enumerateAttribute(.attachment, in: NSRange(location: 0, length: s.length), options: []) { v, _, _ in
+            if v is NSTextAttachment { n += 1 }
+        }
+        return n
+    }
+
+    private func writeRich(_ id: String, _ attr: NSAttributedString) {
+        guard let u = richURL(id) else { return }
+        // 老 .rtf 不再写：留着它，下次打开会读到过期内容（attributed 先认 .rtfd，
+        // 但一旦正文清空就要靠删文件表达「这篇没有格式」）
+        if let old = legacyRichURL(id) { try? FileManager.default.removeItem(at: old) }
+        guard let w = RichText.rtfd(attr) else {
+            try? FileManager.default.removeItem(at: u)
+            richSig[id] = ""
+            return
+        }
+        let sig = Self.richSignature(attr)
+        if richSig[id] == sig, FileManager.default.fileExists(atPath: u.path) { return }
+        // ⚠️ 目录包要整包换：先删再写。`options: .atomic` 对目录包不成立
+        //（它只对普通文件做「临时文件 + rename」），实测写出来是个空壳。
+        try? FileManager.default.removeItem(at: u)
+        do {
+            try w.write(to: u, options: [], originalContentsURL: nil)
+            richSig[id] = sig
+        } catch {
+            status = "正文存不下：\(error.localizedDescription)"
+        }
+    }
+
+    private func dropRich(_ id: String) {
+        if let u = richURL(id) { try? FileManager.default.removeItem(at: u) }
+        if let u = legacyRichURL(id) { try? FileManager.default.removeItem(at: u) }
+        richSig[id] = ""
+    }
+
+    /// 正文指纹：字数 + 文字 + 图的数量和字节数。够挡住「防抖白写一整包」这件事，
+    /// 又不至于为了比一遍去把包序列化两次。
+    private static func richSignature(_ s: NSAttributedString) -> String {
+        var imgs = 0
+        var bytes = 0
+        s.enumerateAttribute(.attachment, in: NSRange(location: 0, length: s.length), options: []) { v, _, _ in
+            guard let a = v as? NSTextAttachment else { return }
+            imgs += 1
+            bytes &+= NoteAttachment.pngData(from: a)?.count ?? 0
+        }
+        return "\(s.length)|\(s.string.hashValue)|\(imgs)|\(bytes)"
+    }
+
+    /// 老数据的图（正文下面那条图片条）迁进正文：打开记事本时扫一遍，有就接在
+    /// 正文末尾、写进 RTFD 包，再把 `images` 清空。
+    ///
+    /// 为什么必须迁：那一条已经整块删掉了（菲哥：「插图应该和文字在一起，而不是在下面」）。
+    /// 不迁的话，老笔记里的图不是「挪了位置」而是**彻底看不见** —— 对用户就是丢数据。
+    private func migrateLegacyImages() {
+        var changed = false
+        for i in nodes.indices where !nodes[i].images.isEmpty && !nodes[i].folder {
+            let id = nodes[i].id
+            let m = NSMutableAttributedString(attributedString: attributed(id))
+            var moved = 0
+            for name in nodes[i].images {
+                guard let u = imageDir?.appendingPathComponent(name),
+                      let img = NSImage(contentsOf: u), let png = img.shubanPNG(),
+                      let a = NoteAttachment.image(png) else { continue }
+                if m.length > 0 { m.append(RichText.attributed(fromPlain: "\n")) }
+                m.append(NSAttributedString(attachment: a))
+                moved += 1
+            }
+            nodes[i].images = []
+            changed = true
+            if moved > 0 { writeRich(id, m) }
+        }
+        if changed {
+            // ⚠️ 立刻落盘，不走防抖：`images` 清空这件事必须一次生效。
+            // 防抖那 0.7 秒里崩一次或者被 kill 一次，下次启动就会照着旧 JSON
+            // 再插一遍 —— 图会从 1 张变 2 张（用例真的撞到过）。
+            saveNow()
+            status = "老笔记里的图已挪进正文"
+        }
+    }
+
+    // MARK: 附件文件（正文里的「插文件」）
+
+    func fileURL(_ name: String) -> URL? { filesDir?.appendingPathComponent(name) }
+
+    /// 芯片指向的**实体**路径。名字想翻出 `files/` 之外就返回 nil。
+    ///
+    /// `fileName(from:)` 那边已经挡住了带 `/` 和 `..` 的名字，这里再挡一道是在**用的地方**
+    /// 兜底：附件名是从存档里读出来的，手改过 notes.json 旁边那个包、或者哪天解析逻辑
+    /// 改了，都可能漏进来一个「..」。点一下芯片就能开附件目录外的东西，不能靠上游保证。
+    func filePath(_ name: String) -> URL? {
+        guard let d = filesDir else { return nil }
+        let base = d.standardizedFileURL.path
+        let u = d.appendingPathComponent(name).standardizedFileURL
+        guard u.path.hasPrefix(base + "/") else { return nil }
+        return u
+    }
+
+    func fileExists(_ name: String) -> Bool {
+        guard let u = filePath(name) else { return false }
+        return FileManager.default.fileExists(atPath: u.path)
+    }
+
+    /// 把用户选的文件拷进 `files/`，返回落盘用的文件名（正文里的芯片就用它）。
+    /// 同名不覆盖：加「 2」「 3」，跟录屏那边的习惯保持一致 —— 覆盖等于悄悄毁了
+    /// 另一篇笔记的附件。
+    @discardableResult
+    func addFile(_ url: URL) -> String? {
+        guard let d = filesDir else { return nil }
+        let orig = url.lastPathComponent
+        guard !orig.isEmpty else { status = "这个文件没名字，放不进来"; return nil }
+        var name = orig
+        var k = 2
+        while FileManager.default.fileExists(atPath: d.appendingPathComponent(name).path) {
+            let base = (orig as NSString).deletingPathExtension
+            let ext = (orig as NSString).pathExtension
+            name = ext.isEmpty ? "\(base) \(k)" : "\(base) \(k).\(ext)"
+            k += 1
+            if k > 999 { status = "同名文件太多了"; return nil }
+        }
+        do {
+            try FileManager.default.copyItem(at: url, to: d.appendingPathComponent(name))
+        } catch {
+            status = "文件拷不进来：\(error.localizedDescription)"
+            return nil
+        }
+        status = "已插入 \(name)"
+        return name
+    }
+
+    /// 在默认应用里打开芯片指向的文件
+    func openFile(_ name: String) {
+        guard let u = filePath(name), FileManager.default.fileExists(atPath: u.path) else {
+            status = "找不到附件 \(name)（可能被移走了）"
+            return
+        }
+        NSWorkspace.shared.open(u)
+    }
+
+    /// 删笔记时顺手清掉只有它用过的附件。
+    /// 判据故意放宽成「别的笔记正文里提到过这个名字就不删」：宁可留一个孤儿文件，
+    /// 也不能把另一篇还在用的附件删掉（正文的纯文本投影里就带着文件名）。
+    private func deleteOrphanFiles(_ names: [String]) {
+        guard !names.isEmpty else { return }
+        let alive = nodes.map(\.body).joined(separator: "\n")
+        for n in Set(names) where !alive.contains(n) {
+            if let u = fileURL(n) { try? FileManager.default.removeItem(at: u) }
+        }
+    }
+
+    /// 一篇笔记正文里用到的附件名（从芯片的链接里取）。删除时要靠它决定哪些文件能一起清掉。
+    func referencedFiles(in id: String) -> [String] {
+        let s = attributed(id)
+        var out: [String] = []
+        s.enumerateAttribute(.link, in: NSRange(location: 0, length: s.length), options: []) { v, _, _ in
+            guard let u = v as? URL, let name = NoteAttachment.fileName(from: u) else { return }
+            out.append(name)
+        }
+        return out
+    }
+
     func remove(_ id: String) {
         let ids = subtree(id)
+        var files: [String] = []
         for n in nodes where ids.contains(n.id) {
-            for img in n.images { deleteImageFile(img) }
-            if let u = richURL(n.id) { try? FileManager.default.removeItem(at: u) }
+            files.append(contentsOf: referencedFiles(in: n.id))
+            dropRich(n.id)
         }
         nodes.removeAll { ids.contains($0.id) }
         expanded.subtract(ids)
         if let s = selected, ids.contains(s) {
             selected = children(nil).first?.id
         }
+        deleteOrphanFiles(files)
         scheduleSave()
         status = ids.count > 1 ? "已删除 \(ids.count) 项" : "已删除"
     }
@@ -437,51 +624,6 @@ final class NoteStore: ObservableObject {
 
     // MARK: 图片
 
-    func image(_ name: String) -> NSImage? {
-        if let c = cache[name] { return c }
-        guard let u = imageDir?.appendingPathComponent(name), let img = NSImage(contentsOf: u) else { return nil }
-        cache[name] = img
-        return img
-    }
-
-    func imageURL(_ name: String) -> URL? { imageDir?.appendingPathComponent(name) }
-
-    /// 贴图：把图片落到 data/notes/images/，再把文件名挂到当前笔记上
-    @discardableResult
-    func addImage(_ data: Data, ext: String = "png") -> Bool {
-        guard let n = selectedNode else { status = "先选一条笔记再贴图"; return false }
-        guard !n.folder else { status = "文件夹里放不了图，选一条笔记"; return false }
-        guard let d = imageDir else { return false }
-        let name = UUID().uuidString.prefix(8) + "-\(n.images.count + 1)." + ext
-        let url = d.appendingPathComponent(String(name))
-        do { try data.write(to: url, options: .atomic) } catch {
-            status = "图片存不下：\(error.localizedDescription)"
-            return false
-        }
-        if let i = nodes.firstIndex(where: { $0.id == n.id }) {
-            nodes[i].images.append(String(name))
-            nodes[i].updatedAt = Date().timeIntervalSince1970
-        }
-        galleryTick &+= 1
-        scheduleSave()
-        status = "已贴图 · 共 \(n.images.count + 1) 张"
-        return true
-    }
-
-    @discardableResult
-    func addImage(_ img: NSImage) -> Bool {
-        guard let d = img.shubanPNG() else { status = "这张图转不成 PNG"; return false }
-        return addImage(d)
-    }
-
-    /// 从文件贴图。HEIC/WebP 这类 NSImage 能读但浏览器不认，统一转成 PNG 存，
-    /// 顺带把超大截图缩到 1600 宽 —— 不然几张原图就把 notes/images 撑到上百兆。
-    @discardableResult
-    func addImage(_ url: URL) -> Bool {
-        guard let img = NSImage(contentsOf: url) else { status = "读不了 \(url.lastPathComponent)"; return false }
-        return addImage(img)
-    }
-
     func setStatus(_ s: String) { status = s }
 
     /// 拖动落点：目标是文件夹就放进去，是笔记就排到它前面（跟它同级）
@@ -490,22 +632,9 @@ final class NoteStore: ObservableObject {
         if t.folder { move(id, to: t.id) } else { move(id, to: t.parent, before: t.id) }
     }
 
-    func removeImage(_ name: String, from id: String) {
-        guard let i = nodes.firstIndex(where: { $0.id == id }) else { return }
-        nodes[i].images.removeAll { $0 == name }
-        nodes[i].updatedAt = Date().timeIntervalSince1970
-        deleteImageFile(name)
-        if previewImage == name { previewImage = nil }
-        galleryTick &+= 1
-        scheduleSave()
-        status = "已删掉一张图"
-    }
-
-    private func deleteImageFile(_ name: String) {
-        cache.removeValue(forKey: name)
-        if let u = imageDir?.appendingPathComponent(name) { try? FileManager.default.removeItem(at: u) }
-    }
-
+    /// 正文里的图现在都进了 RTFD 包，所以这儿只剩「从剪贴板认出一张图」这一件事。
+    /// 落盘那一步在 `RichEditorBridge.insertImage`（它得知道光标在哪）。
+    ///
     /// 从剪贴板取图。只认「真的是图」的情况：纯文本照常交给编辑器自己贴。
     /// 拷文件时系统会塞一个 NSImage 表示，直接取会把 PDF 之类也当图存进来，所以
     /// 先看 png/tiff 数据，再看文件 URL 的扩展名白名单。
@@ -579,6 +708,20 @@ extension NoteStore {
         var fail = 0
         func check(_ name: String, _ ok: Bool, _ extra: String = "") {
             if ok { pass += 1; say("  ✓ \(name)") } else { fail += 1; say("  ✗ \(name) \(extra)") }
+        }
+        func attachments(_ a: NSAttributedString) -> [NSTextAttachment] {
+            var out: [NSTextAttachment] = []
+            a.enumerateAttribute(.attachment, in: NSRange(location: 0, length: a.length), options: []) { v, _, _ in
+                if let t = v as? NSTextAttachment { out.append(t) }
+            }
+            return out
+        }
+        func chipNames(_ a: NSAttributedString) -> [String] {
+            var out: [String] = []
+            a.enumerateAttribute(.link, in: NSRange(location: 0, length: a.length), options: []) { v, _, _ in
+                if let u = v as? URL, let n = NoteAttachment.fileName(from: u) { out.append(n) }
+            }
+            return out
         }
 
         // 自检自带临时目录，按 base/data/notes 断言。外面再传 WECAL_NOTES_DIR
@@ -654,35 +797,63 @@ extension NoteStore {
         check("上移改变了同级顺序", orderBefore != orderAfter, "\(orderBefore) → \(orderAfter)")
         check("上移后两条都还在", orderAfter.contains(a) && orderAfter.contains(b))
 
-        // 7. 贴图
+        // 7. 正文里的图：落成 RTFD 包、读回来还在、纯文本投影里不留占位符
         let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 40, pixelsHigh: 30,
                                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
                                    isPlanar: false, colorSpaceName: .deviceRGB,
                                    bytesPerRow: 0, bitsPerPixel: 0)!
         let img = NSImage(size: NSSize(width: 40, height: 30))
         img.addRepresentation(rep)
-        s.selected = n2!.id
-        let added = s.addImage(img)
-        let imgName = s.node(n2!.id)?.images.first
-        check("贴图写进了 images 列表", added && imgName != nil)
-        check("图片文件真的存在",
-              imgName != nil && s.imageURL(imgName!) != nil
-                && FileManager.default.fileExists(atPath: s.imageURL(imgName!)!.path))
-        check("缩略图能读出来", imgName != nil && s.image(imgName!) != nil)
-        s.removeImage(imgName ?? "", from: n2!.id)
-        check("删图同时删掉文件",
-              imgName != nil && !FileManager.default.fileExists(atPath: s.imageURL(imgName!)!.path))
+        let noteID = n2!.id
+        let withImg = NSMutableAttributedString(attributedString: RichText.attributed(fromPlain: "图夹在字中间"))
+        if let a = img.shubanPNG().flatMap({ NoteAttachment.image($0) }) {
+            withImg.append(NSAttributedString(attachment: a))
+        }
+        withImg.append(RichText.attributed(fromPlain: "后文"))
+        s.setRichBody(noteID, withImg)
+        check("正文里的图落成 rich/<id>.rtfd 包",
+              s.richURL(noteID).map { FileManager.default.fileExists(atPath: $0.path) } ?? false)
+        let backImg = s.attributed(noteID)
+        check("图从包里读回来了", attachments(backImg).count == 1, "\(attachments(backImg).count) 个")
+        check("读回来的图有尺寸（不修的话 bounds 是全 0）",
+              (attachments(backImg).first?.bounds.width ?? 0) > 10)
+        check("纯文本投影里没有附件占位符",
+              s.node(noteID)?.body == "图夹在字中间后文",
+              s.node(noteID)?.body.debugDescription ?? "nil")
 
-        // 8. 删节点连带子树（图片也要跟着删）
+        // 7b. 附件文件：拷进 files/、同名加序号、正文里只有一个芯片
+        let src = base.appendingPathComponent("方案.pptx")
+        try? Data("x".utf8).write(to: src)
+        let f1 = s.addFile(src)
+        let f2name = s.addFile(src)
+        check("插文件：真拷进 files/", f1.map { s.fileExists($0) } ?? false)
+        check("同名不覆盖（加序号）", f1 != nil && f2name != nil && f1 != f2name, "\(f1 ?? "nil") / \(f2name ?? "nil")")
+        check("文件内容真拷过来了",
+              f1.flatMap { s.fileURL($0) }.flatMap { try? Data(contentsOf: $0) }.map { $0.count == 1 } ?? false)
+
+        let withChip = NSMutableAttributedString(attributedString: RichText.attributed(fromPlain: "附件："))
+        if let f1 { withChip.append(NoteAttachment.chip(name: f1)) }
+        s.setRichBody(noteID, withChip)
+        check("芯片的链接能存进包再读回来", chipNames(s.attributed(noteID)) == [f1].compactMap { $0 })
+        check("芯片在纯文本投影里只剩文件名", s.node(noteID)?.body == "附件：" + (f1 ?? ""))
+        check("附件路径只在 files/ 里才认",
+              f1 != nil && s.filePath(f1!) != nil && s.filePath("../../etc/passwd") == nil)
+
+        // 8. 删节点连带子树（它引用的附件文件也要跟着删）
         s.selected = inner!
-        s.addImage(img)
-        let img2 = s.node(inner!)?.images.first
+        let innerSrc = base.appendingPathComponent("子目录里的.docx")
+        try? Data("y".utf8).write(to: innerSrc)
+        let innerFile = s.addFile(innerSrc)
+        let innerText = NSMutableAttributedString(attributedString: RichText.attributed(fromPlain: "带附件"))
+        if let innerFile { innerText.append(NoteAttachment.chip(name: innerFile)) }
+        s.setRichBody(inner!, innerText)
         let doomed = s.subtree(f2!.id).count
         s.remove(f2!.id)
         check("删文件夹连带子项", doomed >= 3 && s.node(f2!.id) == nil, "doomed=\(doomed)")
         check("子树里的条目全清了", s.node(welcome.id) == nil && s.node(inner!) == nil)
-        check("子项图片一起删掉",
-              img2 != nil && !FileManager.default.fileExists(atPath: s.imageURL(img2!)!.path))
+        check("子项的附件文件一起删掉",
+              innerFile != nil && !s.fileExists(innerFile!), innerFile ?? "nil")
+        check("不在删除范围内的附件留着", f1 != nil && s.fileExists(f1!), f1 ?? "nil")
         check("删完还能选中别的条目", s.selectedNode != nil)
 
         // 9. 落盘 → 重载
@@ -703,7 +874,30 @@ extension NoteStore {
         check("坏文件被另存为 notes.bad.json",
               FileManager.default.fileExists(atPath: base.appendingPathComponent("data/notes/notes.bad.json").path))
 
-        // 11. ⌘V 贴图的判定逻辑（用独立剪贴板，不动用户的）
+        // 12. 老数据的图（这一轮之前在正文下面那条图片条里）必须迁进正文，
+        //     否则「把下面那条删掉」对老笔记就等于把图删掉了
+        struct LDoc: Codable { var version = 1; var nodes: [NoteNode]; var expanded: [String] }
+        let lBase = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("shuban-notes-legacy-\(UUID().uuidString.prefix(6))", isDirectory: true)
+        let lDir = lBase.appendingPathComponent("data/notes", isDirectory: true)
+        let lImgDir = lDir.appendingPathComponent("images", isDirectory: true)
+        try? FileManager.default.createDirectory(at: lImgDir, withIntermediateDirectories: true)
+        try? img.shubanPNG()?.write(to: lImgDir.appendingPathComponent("old-1.png"))
+        let old = NoteNode(id: "L1", title: "老笔记", body: "老的正文", images: ["old-1.png"], order: 0)
+        try? JSONEncoder().encode(LDoc(nodes: [old], expanded: []))
+            .write(to: lDir.appendingPathComponent("notes.json"))
+        let sl = NoteStore()
+        sl.configure(projectDir: lBase)
+        check("老笔记的图迁进了正文", sl.imageCount("L1") == 1, "\(sl.imageCount("L1")) 张")
+        check("迁移后 images 清空", sl.node("L1")?.images.isEmpty == true)
+        check("老正文没被动掉", sl.node("L1")?.body.contains("老的正文") == true)
+        let sl2 = NoteStore()
+        sl2.configure(projectDir: lBase)
+        check("迁完重开图还在（说明真写进包了）", sl2.imageCount("L1") == 1,
+              "图 \(sl2.imageCount("L1")) 张 · 包在=\(FileManager.default.fileExists(atPath: lDir.appendingPathComponent("rich/L1.rtfd").path)) · images=\(sl2.node("L1")?.images ?? [])")
+        try? FileManager.default.removeItem(at: lBase)
+
+        // 13. ⌘V 贴图的判定逻辑（用独立剪贴板，不动用户的）
         let pb = NSPasteboard(name: NSPasteboard.Name("shuban.notes.test"))
         pb.clearContents()
         pb.setData(img.shubanPNG() ?? Data(), forType: .png)

@@ -4147,16 +4147,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return tv.selectedRange().length == n ? "" : "选中 \(tv.selectedRange().length) / 共 \(n)"
         }))
 
-        // ⑤ 剪贴板里是位图 → ⌘V 仍然走「贴图」，不能被并进来的编辑键分支抢走。
-        //    贴图与粘文字共用 ⌘V，两条规矩合成一个监视器之后，谁先谁后必须验一遍。
+        // ⑤ 剪贴板里是位图 → ⌘V 把图**插进正文**（不再挂到正文下面那条图片条上）。
+        //    ⌘V 同时是「粘文字」和「贴图」两条路的入口，共用一个按键监视器，
+        //    谁先谁后必须验一遍：文字要照常粘，图要变成正文里的附件。
         var imgsBefore = -1
         var bodyBefore = ""
-        // 数全库的图，而不是「当前选中那条」的图：贴完图这一下选中项可能自己挪走
-        // （试运行看到过），盯着选中项会假红成「0 张 → 0 张」，其实图好好躺在另一条上。
-        func totalImages() -> Int { self.notes.nodes.reduce(0) { $0 + $1.images.count } }
-        steps.append(("剪贴板里是图 → ⌘V 仍然贴图", 5, {
-            imgsBefore = totalImages()
-            bodyBefore = tv.string
+        func bodyImages() -> Int {
+            guard let st = tv.textStorage else { return -1 }
+            var n = 0
+            st.enumerateAttribute(.attachment, in: NSRange(location: 0, length: st.length), options: []) { v, _, _ in
+                if v is NSTextAttachment { n += 1 }
+            }
+            return n
+        }
+        steps.append(("剪贴板里是图 → ⌘V 插进正文（附件数 +1）", 5, {
+            // 上一步 ⌘A 全选中着。贴图走的是「替换选区」（和粘文字同一条语义），
+            // 不先把光标收到末尾，这一步会把整篇正文换掉 —— 那不是这条用例要验的东西。
+            let n = (tv.string as NSString).length
+            tv.setSelectedRange(NSRange(location: n, length: 0))
+            imgsBefore = bodyImages()
+            bodyBefore = RichText.plain(tv.attributedString())
             pb.clearContents()
             if let bmp = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 8,
                                           bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
@@ -4167,11 +4177,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             press("v", 9, win: p)
         }, {
-            let after = totalImages()
+            let after = bodyImages()
             if after != imgsBefore + 1 {
-                return "贴图没成（\(imgsBefore) 张 → \(after) 张 · status=\(self.notes.status)）"
+                return "图没进正文（正文里 \(imgsBefore) 张 → \(after) 张 · status=\(self.notes.status)）"
             }
-            return tv.string == bodyBefore ? "" : "贴图顺手往正文塞了字：\(tv.string.debugDescription)"
+            // 图独占一行：插的是「图 + 换行」，所以纯文本投影只该多一个换行，
+            // 多出别的字就是哪里不对（比如把剪贴板里的文件名当文字粘进来了）
+            let now = RichText.plain(tv.attributedString())
+            return now == bodyBefore + "\n" ? ""
+                : "贴图顺手往正文塞了字：\(bodyBefore.debugDescription) → \(now.debugDescription)"
+        }))
+
+        // ⑤b 焦点在搜索框时按 ⌘V：图仍然进正文（末尾），但**绝不能进搜索框**。
+        //     搜索框底下也是 NSTextView（field editor），按键层按「当前文本框」认人
+        //     就会把图贴进搜索词里 —— 这一条就是钉那个守卫的。
+        var searchField: NSTextField? = nil
+        var imgsBefore2 = -1
+        steps.append(("焦点在搜索框时 ⌘V 贴图 → 进正文末尾，搜索框干净", 6, {
+            guard let field = Self.findField(p.contentView, placeholder: "搜标题和正文") else { return }
+            searchField = field
+            imgsBefore2 = bodyImages()
+            p.makeFirstResponder(field)
+            pb.clearContents()
+            if let bmp = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 8,
+                                          bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                          isPlanar: false, colorSpaceName: .deviceRGB,
+                                          bytesPerRow: 0, bitsPerPixel: 0),
+               let tiff = bmp.representation(using: .tiff, properties: [:]) {
+                pb.setData(tiff, forType: .tiff)
+            }
+            press("v", 9, win: p)
+        }, {
+            guard let f = searchField else { return "找不到搜索框" }
+            if !f.stringValue.isEmpty {
+                return "图贴进搜索框了：\(f.stringValue.debugDescription)"
+            }
+            return bodyImages() == imgsBefore2 + 1 ? ""
+                : "正文里没多一张图（\(imgsBefore2) → \(bodyImages())）"
         }))
 
         // ⑥ 待办输入框：日历窗底栏那个 SwiftUI TextField，背后是 field editor，
@@ -4231,8 +4273,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 且必须配 `WECAL_NOTES_DIR=<临时目录>`（它会真的往 rich/ 里写文件）。
     private func runRichTest(retry: Int = 0, pass p0: Int = 0, fail f0: Int = 0) {
         var pass = p0, fail = f0
-        func check(_ ok: Bool, _ label: String) {
-            say(ok ? "  ✓ \(label)" : "  ✗ \(label)")
+        func check(_ ok: Bool, _ label: String, _ extra: String = "") {
+            say(ok ? "  ✓ \(label)" : "  ✗ \(label)\(extra.isEmpty ? "" : " · " + extra)")
             if ok { pass += 1 } else { fail += 1 }
         }
         func done() {
@@ -4240,7 +4282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             exit(fail == 0 ? 0 : 1)
         }
         guard let notesDir = ProcessInfo.processInfo.environment["WECAL_NOTES_DIR"], !notesDir.isEmpty else {
-            say("  ✗ 这个用例必须配 WECAL_NOTES_DIR=<临时目录> 跑：它会往 rich/ 里真写 rtf")
+            say("  ✗ 这个用例必须配 WECAL_NOTES_DIR=<临时目录> 跑：它会往 rich/ 里真写 RTFD 包")
             say("== 结果：0 通过 / 1 失败 ==")
             exit(1)
         }
@@ -4248,6 +4290,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             s.attributes(at: min(i, max(0, s.length - 1)), effectiveRange: nil)
         }
         func fontOf(_ d: [NSAttributedString.Key: Any]) -> NSFont? { d[.font] as? NSFont }
+        func atts(_ s: NSAttributedString) -> [NSTextAttachment] {
+            var out: [NSTextAttachment] = []
+            s.enumerateAttribute(.attachment, in: NSRange(location: 0, length: s.length), options: []) { v, _, _ in
+                if let a = v as? NSTextAttachment { out.append(a) }
+            }
+            return out
+        }
+        func chipNames(_ s: NSAttributedString) -> [String] {
+            var out: [String] = []
+            s.enumerateAttribute(.link, in: NSRange(location: 0, length: s.length), options: []) { v, _, _ in
+                if let u = v as? URL, let n = NoteAttachment.fileName(from: u) { out.append(n) }
+            }
+            return out
+        }
+        /// 一张 60×40 的真 PNG（有色差，免得系统把「全透明」当空图优化掉）
+        func tinyPNG() -> Data? {
+            guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 60, pixelsHigh: 40,
+                                             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                             isPlanar: false, colorSpaceName: .deviceRGB,
+                                             bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+            for x in 0..<60 { for y in 0..<40 {
+                rep.setColor(NSColor(srgbRed: CGFloat(x) / 60, green: 0.3, blue: 0.6, alpha: 1), atX: x, y: y)
+            }}
+            return rep.representation(using: .png, properties: [:])
+        }
 
         if retry == 0 {
             say("== 富文本用例 ==")
@@ -4320,25 +4387,159 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                   "洗白：白字洗成墨色")
             check(attrs(clean, 0)[.backgroundColor] == nil, "洗白：外来的深灰底丢掉")
 
-            // ⑥ 图片附件不能被洗进正文（图走图片条，进正文会把落盘和搜索一起带坏）
-            let withImg = NSMutableAttributedString(string: "文字")
-            withImg.append(NSAttributedString(attachment: NSTextAttachment()))
-            withImg.append(NSAttributedString(string: "结尾"))
-            check(RichText.launder(withImg).string == "文字结尾", "洗白：图片附件不进正文")
+            // ⑥ 洗白与正文里的「非文字内容」。规矩：图可以跟字在一起，但只有
+            ///    我们自己做出来的那种附件（限宽、PNG、数据在 fileWrapper 里）算数；
+            //    外来的嵌入对象（表格、视频占位…）存不住也搜不到，一律不进正文。
+            let noImg = NSMutableAttributedString(string: "文字")
+            noImg.append(NSAttributedString(attachment: NSTextAttachment()))   // 空对象：不是图
+            noImg.append(NSAttributedString(string: "结尾"))
+            check(RichText.launder(noImg).string == "文字结尾", "洗白：不是图的附件不进正文")
 
-            // ⑦ RTF 往返：只粗三个字，回来还得只粗那三个字
+            guard let png = tinyPNG() else {
+                check(false, "造不出一张测试 PNG，内联图相关的断言全都没法做")
+                done()
+                return
+            }
+            let mine = NSMutableAttributedString(string: "前")
+            if let a = NoteAttachment.image(png) { mine.append(NSAttributedString(attachment: a)) }
+            mine.append(NSAttributedString(string: "后"))
+            let washed = RichText.launder(mine)
+            check(atts(washed).count == 1, "洗白：自己的内联图留着（图就该跟字在一起，不是被洗掉）")
+            check(RichText.plain(washed) == "前后",
+                  "纯文本投影：附件占位符 U+FFFC 被去掉（不然字数凭空多一个怪字符）",
+                  RichText.plain(washed).debugDescription)
+            // 有的应用复制出来的纯文本里就带着裸的 U+FFFC（没有附件属性）。
+            // 上面那条走的是「有附件属性」这条路，挡不住这种 —— 所以 plain 里
+            // 最后还有一道「整串扫一遍去掉 U+FFFC」，这一条钉的就是那道。
+            check(RichText.plain(NSAttributedString(string: "前\u{FFFC}后")) == "前后",
+                  "纯文本投影：正文里裸着的 U+FFFC 也去掉（搜索和字数里没有怪字符）")
+
+            // ⑥b 限宽：一张 2000 宽的截图不能把正文挤成一条缝，等比压到上限
+            let wide = NoteAttachment.bounds(for: NSSize(width: 2000, height: 1000))
+            check(abs(wide.width - NoteAttachment.maxImageWidth) < 0.5,
+                  "超宽图等比限宽到 \(NoteAttachment.maxImageWidth)", "\(wide.width)")
+            check(abs(wide.height - NoteAttachment.maxImageWidth / 2) < 1, "限宽是等比的（高跟着缩）", "\(wide.height)")
+            check(abs(NoteAttachment.bounds(for: NSSize(width: 300, height: 100)).width - 300) < 0.5,
+                  "比上限窄的图不动")
+
+            // ⑥c 文件芯片：正文里就是一段带链接的字，名字大小写不能丢
+            let chip = NoteAttachment.chip(name: "方案V2.PPTX")
+            check(chip.string == "📄 方案V2.PPTX", "芯片文本就是「📄 + 文件名」")
+            let chipURL = (chip.attribute(.link, at: 0, effectiveRange: nil)) as? URL
+            check(chipURL.flatMap(NoteAttachment.fileName(from:)) == "方案V2.PPTX",
+                  "芯片链接取得回原文件名（大小写不被 URL 规范成小写）",
+                  chipURL?.absoluteString ?? "nil")
+            check(NoteAttachment.fileName(from: URL(string: "file:///tmp/x.pdf")!) == nil,
+                  "别人家的 scheme（file://）不当芯片认")
+            check(RichText.plain(NoteAttachment.chip(name: "报价单.xlsx")) == "报价单.xlsx",
+                  "芯片在纯文本投影里只剩文件名（📄 不进搜索和字数）")
+            // 外来富文本里的自定义 scheme 链接必须丢掉：正文里点一下能开任何东西，不合适
+            let shady = NSAttributedString(string: "点我", attributes: [
+                .link: URL(string: "shuban-file://../../etc/passwd")!,
+            ])
+            check(chipNames(RichText.launder(shady)).isEmpty,
+                  "芯片名字里带 ../ 不认（否则点一下能把附件目录外面的东西打开）")
+            let foreignLink = NSAttributedString(string: "本地文件", attributes: [
+                .link: URL(string: "file:///etc/passwd")!,
+            ])
+            check((RichText.launder(foreignLink).attribute(.link, at: 0, effectiveRange: nil)) == nil,
+                  "洗白：file:// 这类外来链接丢掉")
+            // 芯片在编辑器里会被切成几段（选中半截加粗、从中间复制半截贴回来），
+            // 逐段重建就会把一枚芯片变成两枚 —— 相邻同名段必须并成一张
+            let broken = NSMutableAttributedString()
+            broken.append(NSAttributedString(string: "看", attributes: RichText.baseAttributes()))
+            let oneLink = NoteAttachment.link("排期表.xlsx")
+            for piece in ["📄 ", "排期表.", "xlsx"] {
+                broken.append(NSAttributedString(string: piece, attributes: [
+                    .font: RichText.font(size: 13, bold: false, italic: false), .link: oneLink,
+                ]))
+            }
+            let fixed = RichText.launder(broken)
+            check(chipNames(fixed) == ["排期表.xlsx"],
+                  "洗白：碎成三段的芯片并回一枚", chipNames(fixed).description)
+            check(fixed.string == "看📄 排期表.xlsx", "洗白：并完不缺字也不多出字", fixed.string.debugDescription)
+
+            // ⑦ RTFD 往返：只粗两个字，回来还得只粗那两个字
             let rich = NSMutableAttributedString(string: "粗的这段", attributes: RichText.baseAttributes())
             rich.setAttributes(RichText.style(.bold, onto: RichText.baseAttributes()),
                               range: NSRange(location: 0, length: 2))
-            if let data = RichText.rtfData(rich), let back = RichText.attributed(fromRTF: data) {
-                check(back.string == "粗的这段", "RTF 往返：文本一致")
-                check(fontOf(attrs(back, 0)).map(RichText.isBold) ?? false, "RTF 往返：粗体还在")
-                check(!(fontOf(attrs(back, 3)).map(RichText.isBold) ?? true), "RTF 往返：没选中的那半没被带粗")
+            if let w = RichText.rtfd(rich), let back = RichText.attributed(fromRTFD: w) {
+                check(back.string == "粗的这段", "RTFD 往返：文本一致")
+                check(fontOf(attrs(back, 0)).map(RichText.isBold) ?? false, "RTFD 往返：粗体还在")
+                check(!(fontOf(attrs(back, 3)).map(RichText.isBold) ?? true), "RTFD 往返：没选中的那半没被带粗")
             } else {
-                check(false, "RTF 往返：转不出来")
+                check(false, "RTFD 往返：转不出来")
             }
 
-            // ⑧ store：落盘 / 重启后还在 / 纯文本写回作废 / 删笔记连带删 rtf
+            // ⑦b 为什么必须 RTFD：同一段「文字 + 图」，RTF 走一趟图就没了。
+            //     这条是「反证」，钉的是格式选型 —— 哪天有人想换回 RTF，它会立刻红。
+            let imgOnly = NSMutableAttributedString(string: "前文", attributes: RichText.baseAttributes())
+            if let a = NoteAttachment.image(png) { imgOnly.append(NSAttributedString(attachment: a)) }
+            imgOnly.append(RichText.attributed(fromPlain: "后文"))
+            let rtfData = try? imgOnly.data(from: NSRange(location: 0, length: imgOnly.length),
+                                            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
+            let backRTF = rtfData.flatMap {
+                try? NSAttributedString(data: $0,
+                                        options: [.documentType: NSAttributedString.DocumentType.rtf],
+                                        documentAttributes: nil)
+            }
+            check(backRTF.map { atts($0).count } == 0,
+                  "反证：RTF 往返会把图洗掉（附件数 \(backRTF.map { atts($0).count } ?? -1)）→ 所以只能用 RTFD")
+            // 裸读包（不过洗白）：图确实在包里，但 image 是 nil、bounds 全 0。
+            // 钉的是 RTFD 的脾气本身 —— 读回来那一路必须重建附件，不然重开一片空白。
+            let rawBack = RichText.rtfd(imgOnly).flatMap {
+                NSAttributedString(rtfdFileWrapper: $0, documentAttributes: nil)
+            }
+            let rawFirst = rawBack.flatMap { atts($0).first }
+            check(atts(rawBack ?? NSAttributedString()).count == 1
+                    && rawFirst?.image == nil && (rawFirst?.bounds.width ?? -1) == 0,
+                  "反证：裸读 RTFD 包，图取不出来（image=nil、bounds 全 0）→ 读回来得重建附件",
+                  "image=\(rawFirst?.image == nil ? "nil" : "有") bounds=\(rawFirst?.bounds.width ?? -1)")
+            if let w = RichText.rtfd(imgOnly), let back = RichText.attributed(fromRTFD: w) {
+                check(back.string == "前文\u{FFFC}后文", "RTFD 往返：图在文字中间（占位符夹在字里）")
+                check(atts(back).count == 1, "RTFD 往返：图还在")
+                check((atts(back).first?.image != nil) && (atts(back).first?.bounds.width ?? 0) > 0,
+                      "读回来的图被修过（不修 image 是 nil、bounds 全 0，重开就是一片空白）")
+            } else {
+                check(false, "带图的 RTFD 转不出来")
+            }
+            // 芯片和图一起走一遍包：链接是 RTF 就存得住的东西，图只有 RTFD 存得住
+            let mixed = NSMutableAttributedString(attributedString: imgOnly)
+            mixed.append(NoteAttachment.chip(name: "现场照片说明.docx"))
+            if let w = RichText.rtfd(mixed), let back = RichText.attributed(fromRTFD: w) {
+                check(atts(back).count == 1 && chipNames(back) == ["现场照片说明.docx"],
+                      "RTFD 往返：图和芯片同时存住", "图 \(atts(back).count) 个 / 芯片 \(chipNames(back))")
+            } else {
+                check(false, "图 + 芯片的 RTFD 转不出来")
+            }
+
+            // ⑦c 项目符号：RTF/RTFD 读回来会把点**物化进正文**（段首多出 "\t•\t"），
+            //     段落又照旧带着列表 —— 显示成两个点、搜索里也混进点号。
+            //     拍 README 图时才撞见（每条前面两个点），所以这一条钉两件事：
+            //     读回来正文一字不多，而且连续往返三次都不累积。
+            let bulleted = NSMutableAttributedString()
+            for t in ["一\n", "二\n", "三\n"] {
+                bulleted.append(NSAttributedString(string: t,
+                                                   attributes: RichText.style(.bullet, onto: RichText.baseAttributes())))
+            }
+            check(RichText.hasBullet(attrs(bulleted, 0)[.paragraphStyle] as? NSParagraphStyle),
+                  "项目符号：属性里真的带着列表")
+            var loop: NSAttributedString = bulleted
+            for _ in 0..<3 {
+                guard let w2 = RichText.rtfd(loop), let b2 = RichText.attributed(fromRTFD: w2) else { break }
+                loop = b2
+            }
+            check(loop.string == "一\n二\n三\n",
+                  "项目符号往返三次：正文一个字都没多（点不能被物化进正文）",
+                  loop.string.debugDescription)
+            check(RichText.hasBullet(attrs(loop, 0)[.paragraphStyle] as? NSParagraphStyle),
+                  "项目符号往返三次：列表还在（点还是列表画的）")
+            check(RichText.plain(loop) == "一\n二\n三\n", "项目符号不进纯文本投影（搜索和字数里没有点）")
+
+            // 链接色（「自带的系统蓝会盖掉段落属性」）要看着真窗口里那一份正文视图才算数，
+            // 放到后半段的真按键里（`tv` 就是从记事本窗里捞出来的那个 RichTextView）。
+
+            // ⑧ store：落成包 / 重启后还在 / 纯文本写回作废 / 删笔记连带删包
             let ns = self.notes
             ns.selected = nil
             ns.add(folder: false)
@@ -4347,33 +4548,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 done()
                 return
             }
-            let body = NSMutableAttributedString(string: "落盘测试", attributes: RichText.baseAttributes())
+            let body = NSMutableAttributedString(attributedString: RichText.attributed(fromPlain: "落盘测试"))
             body.setAttributes(RichText.style(.bold, onto: RichText.baseAttributes()),
                                range: NSRange(location: 0, length: 2))
+            if let a = NoteAttachment.image(png) { body.append(NSAttributedString(attachment: a)) }
+            body.append(NoteAttachment.chip(name: "随附说明.pdf"))
             ns.setRichBody(id, body)
             ns.saveNow()
-            guard let rtfURL = ns.richURL(id) else {
-                check(false, "拿不到 rtf 路径")
+            guard let pkg = ns.richURL(id) else {
+                check(false, "拿不到富文本包的路径")
                 done()
                 return
             }
-            check(FileManager.default.fileExists(atPath: rtfURL.path), "富文本真写成 rich/<id>.rtf")
-            check(ns.node(id)?.body == "落盘测试", "body 同步成纯文本投影（搜索和字数靠它）")
+            check(FileManager.default.fileExists(atPath: pkg.path), "富文本真落成 rich/<id>.rtfd")
+            check(ns.node(id)?.body == "落盘测试随附说明.pdf",
+                  "body = 纯文本投影：图不留占位符、芯片只留文件名（搜索和字数指着它）",
+                  ns.node(id)?.body.debugDescription ?? "nil")
 
             let again = NoteStore()
             again.configure(projectDir: nil)   // 目录同样来自 WECAL_NOTES_DIR：等于「重启一次」
             let reloaded = again.attributed(id)
-            check(reloaded.string == "落盘测试", "重载后文本一致")
+            check(reloaded.string == "落盘测试\u{FFFC}\u{1F4C4} 随附说明.pdf",
+                  "重载后文本一致（图是占位符、芯片是「📄 + 文件名」）",
+                  reloaded.string.debugDescription)
             check(fontOf(attrs(reloaded, 0)).map(RichText.isBold) ?? false, "重载后粗体还在")
+            check(atts(reloaded).count == 1 && (atts(reloaded).first?.image != nil),
+                  "重载后图还在、而且能显示（image 被修回来了）")
+            check(chipNames(reloaded) == ["随附说明.pdf"], "重载后芯片还指向同一个文件")
+            check(again.referencedFiles(in: id) == ["随附说明.pdf"], "删除时能认出这篇用了哪些附件")
 
             again.setBody(id, "改成纯文本")
-            check(!FileManager.default.fileExists(atPath: rtfURL.path),
-                  "写纯文本会把 rtf 删掉（否则界面还显示旧的富文本）")
+            check(!FileManager.default.fileExists(atPath: pkg.path),
+                  "写纯文本会把包删掉（否则界面还显示旧的富文本）")
 
             again.setRichBody(id, RichText.attributed(fromPlain: "再写回富文本"))
-            check(FileManager.default.fileExists(atPath: rtfURL.path), "还能再写回 rtf")
+            check(FileManager.default.fileExists(atPath: pkg.path), "还能再写回一个包")
             again.remove(id)
-            check(!FileManager.default.fileExists(atPath: rtfURL.path), "删笔记连带删掉 rtf")
+            check(!FileManager.default.fileExists(atPath: pkg.path), "删笔记连带删掉包")
         }
 
         if retry == 0 {
@@ -4422,7 +4633,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     // retry 传 1：纯逻辑那 25 条已经跑过，不再重跑（pass/fail 带着走）
                     self.runRichTest(retry: 1, pass: pass, fail: fail)
                 } else {
-                    self.sayCannotReachFront(pass, fail, "「真按 ⌘B / ⌘Z / ⌘V」4 步")
+                    self.sayCannotReachFront(pass, fail, "「前提 + 链接色 + 真按 ⌘B / ⌘Z / ⌘V」5 步")
                 }
             }
             return
@@ -4473,12 +4684,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // SwiftUI 的 `updateNSView` 认为「外部改了内容」就把草稿回写，用例刚设进去的字
         // 下一帧就被换回笔记原文（表现是「正文是 落盘测试」）。窗口不是 key、粘不进来，
         // 也都是同一个根：按键分发到的是 key 窗的响应链，链头不是这个文本视图。
-        steps.append(("前提：记事本窗是 key、app 活跃、焦点在正文", 10, {}, {
+        // 修复「窗不是 key / app 在后台 / 焦点被 SwiftUI 回写顺手复位」。
+        // ⚠️ 这一步必须在**每一步动作之前**都跑一遍，不能只在头一步跑：合成按键是投递给
+        // key 窗响应链的，中途只要有一次焦点飘走，那一下 ⌘Z / ⌘V 就永久丢了 —— 断言只会在
+        // 预算耗尽后报「等不到」，看起来像功能坏了（实测红过一次「撤销之后还是粗的」+
+        // 「正文是 ""」，同一份二进制重跑又全绿）。补刀只补环境，不改任何断言，所以不会把真红洗绿。
+        func heal() {
             if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
             if !p.isKeyWindow { p.makeKeyAndOrderFront(nil) }
             if !p.isKeyWindow { p.makeKey() }   // nonactivating 面板拿 key 的正路，不带动 app
-            if !p.isKeyWindow { return "记事本窗不是 key 窗 · \(premise())" }
             if p.firstResponder !== tv { p.makeFirstResponder(tv) }
+        }
+
+        steps.append(("前提：记事本窗是 key、app 活跃、焦点在正文", 10, heal, {
+            heal()
+            if !p.isKeyWindow { return "记事本窗不是 key 窗 · \(premise())" }
             if p.firstResponder !== tv { return "焦点不在正文 · \(premise())" }
             return NSApp.isActive ? "" : "app 在后台（isActive=false）→ 菜单不参与按键分发"
         }))
@@ -4486,6 +4706,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 「⌘B 真变粗了」这件事有没有发生过 —— 拉这一根线是为了挡住 ⌘Z 那条的假绿：
         // 正文本来就不粗时，「撤销之后不粗」照样成立，于是它会在上一步失败的情况下绿着。
         var bolded = false
+        // 链接色：`NSTextView` 自带一份 linkTextAttributes（系统蓝），盖在段落属性上面 ——
+        // 芯片的金色会被它盖掉显示成蓝色（README 图里那枚蓝芯片就是这么来的）。
+        // 只能在真窗口那份正文视图上验：自己 new 一个 RichTextView 拿到的是系统默认值。
+        steps.append(("正文视图的链接色被钉成金色（不是自带的系统蓝）", 3, {
+        }, {
+            let c = tv.linkTextAttributes?[.foregroundColor] as? NSColor
+            return c == RichPalette.gold ? ""
+                : "是 \(String(describing: c))（芯片和网页链接会显示成系统蓝）"
+        }))
         steps.append(("⌘B 只把选中的三个字变粗", 5, {
             tv.string = "第一段\n第二段"
             tv.setSelectedRange(NSRange(location: 0, length: 3))
@@ -4539,6 +4768,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 return
             }
             if !started {
+                heal()                       // 见上面 heal 的注释：每步动作前都补一次环境
                 steps[idx].act()
                 started = true
                 deadline = Date().addingTimeInterval(steps[idx].budget)
@@ -4646,10 +4876,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    /// 笔记页的 ⌘V 贴图。
-    /// TextEditor 只会把剪贴板里的文本贴进来，图片它不管 —— 所以在按键层截一道：
-    /// 剪贴板里确实是位图就落盘挂到当前笔记上并吞掉事件，是纯文本就原样放行，
-    /// 正文照常粘文字，两种操作不打架。
+    /// 笔记窗的 ⌘V 贴图。
+    /// 文本视图自己不会把位图变成正文里的图 —— 所以在按键层截一道：剪贴板里确实是
+    /// 位图就插进正文（走 `RichEditorBridge`，和「插图片」按钮同一条路）并吞掉事件，
+    /// 是纯文本就原样放行，正文照常粘文字，两种操作不打架。
+    ///
+    /// 光标没落在正文上时（刚开窗、或者焦点在左边树/搜索框）插到**正文末尾**：
+    /// 「⌘V 贴图」这个动作过去就是「贴给这篇笔记」，不能因为没点过正文就变成什么也不做。
+    /// 但绝不会贴进搜索框 —— 那条路只认 `richBridge` 手里那一份正文视图。
     ///
     /// **别在这里顺手接管 ⌘C/⌘X/⌘A/⌘Z**：试过一版，用 `NSApp.sendAction` 把动作发给
     /// 第一响应者，结果 SwiftUI 的 PlatformTextView 一律回「我处理了」却什么也不做
@@ -4664,8 +4898,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let cmd = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
             guard cmd.contains(.command), cmd.intersection([.option, .control]).isEmpty else { return e }
             guard e.charactersIgnoringModifiers?.lowercased() == "v" else { return e }
-            guard let img = NoteStore.imageFromPasteboard() else { return e }
-            _ = self.notes.addImage(img)
+            guard let img = NoteStore.imageFromPasteboard(), let png = img.shubanPNG() else { return e }
+            guard let bridge = self.notes.richBridge else { return e }
+            // 焦点在正文上 → 插到光标处；否则插到正文末尾
+            let onBody = (notesWin.firstResponder as? RichTextView) === bridge.textView
+            bridge.insertImage(png, atEnd: !onBody)
             return nil
         }
     }
