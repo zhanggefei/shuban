@@ -43,7 +43,7 @@
 
 <div align="center">
 
-<img src="docs/screenshots/reminder.png" width="52%" alt="到点提醒" />
+<img src="docs/screenshots/reminder.png" width="48%" alt="到点提醒" />
 
 <sub>到点提醒：盖在全屏应用之上，可直接推迟或完成</sub>
 
@@ -51,7 +51,7 @@
 
 <div align="center">
 
-<img src="docs/screenshots/rec.png" width="52%" alt="录屏面板" />
+<img src="docs/screenshots/rec.png" width="48%" alt="录屏面板" />
 
 <sub>录屏：日历窗顶部「功能」→ 录屏（或 ⌘2），弹自己的窗口，布局按录屏需要排</sub>
 
@@ -59,7 +59,7 @@
 
 <div align="center">
 
-<img src="docs/screenshots/notes.png" width="52%" alt="记事本面板" />
+<img src="docs/screenshots/notes.png" width="48%" alt="记事本面板" />
 
 <sub>记事本：独立窗口才装得下「树 + 正文」两栏，左边自己搭目录树，右边写正文 —— 正文顶上那排是格式条，粗斜下划删除线、五档字号、四档字色、高亮、项目符号、清除格式；图在正文里跟着文字走（中间那张就是插进去的），文件是最后一行那枚金色 📄 芯片，点一下就用默认应用打开</sub>
 
@@ -67,7 +67,7 @@
 
 <div align="center">
 
-<img src="docs/screenshots/listen.png" width="52%" alt="听录窗口" />
+<img src="docs/screenshots/listen.png" width="48%" alt="听录窗口" />
 
 <sub>听录：系统播不动的 .wma 录音拖进来就能听，进度随便拖、播完自动接下一条；关掉窗口声音继续放（图里是脚本生成的示例录音）</sub>
 
@@ -75,7 +75,7 @@
 
 <div align="center">
 
-<img src="docs/screenshots/listen-rec.png" width="52%" alt="听录·正在录音" />
+<img src="docs/screenshots/listen-rec.png" width="48%" alt="听录·正在录音" />
 
 <sub>听录 · 录音态：点「● 录音」就地换成录音台 —— 大计时、实时电平、停止并保存 / 取消，`Esc` 也能停；录到的存进 `~/Music/书办录音` 并自动进列表</sub>
 
