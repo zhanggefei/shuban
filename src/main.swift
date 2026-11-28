@@ -2552,13 +2552,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 尺寸上限要再被屏幕可见区夹一道。之前只夹 maxW/maxH（768/1040），
     /// 于是在 1440×900 这种屏上能把窗口拉得比可见区还高（顶部压在菜单栏底下）。
-    nonisolated static func fitToScreen(_ f: NSRect, _ vf: NSRect) -> NSRect {
+    ///
+    /// `min` / `max` 是**这扇窗自己的**上下限。不传时用日历窗的（320–768 × 430–1040）。
+    /// 子功能窗口必须传自己的：记事本默认就有 780 宽、上限 1200，录屏上限 900、听录 1100。
+    /// 若先按日历窗的 768 裁一刀，宽于 768 的存档再打开就永远回不到原来的宽度
+    ///（默认的记事本窗也会被收成 768）。下限同理，记事本最矮 440，不能被抬成日历窗的 430 就停。
+    nonisolated static func fitToScreen(_ f: NSRect, _ vf: NSRect,
+                                        min minSize: NSSize? = nil,
+                                        max maxSize: NSSize? = nil) -> NSRect {
         var g = f
-        // 上限 = maxW 与「屏幕可见区」里较小的那个，但不能低于下限本身
-        let upperW = max(minW, min(maxW, vf.width))
-        let upperH = max(minH, min(maxH, vf.height))
-        g.size.width = min(max(f.width, minW), upperW)
-        g.size.height = min(max(f.height, minH), upperH)
+        let lo = minSize ?? NSSize(width: minW, height: minH)
+        let hi = maxSize ?? NSSize(width: maxW, height: maxH)
+        // 上限 = 这扇窗的上限与「屏幕可见区」里较小的那个，但不能低于下限本身
+        let upperW = max(lo.width, min(hi.width, vf.width))
+        let upperH = max(lo.height, min(hi.height, vf.height))
+        g.size.width = min(max(f.width, lo.width), upperW)
+        g.size.height = min(max(f.height, lo.height), upperH)
         g.origin.x = min(max(g.origin.x, vf.minX), max(vf.minX, vf.maxX - g.width))
         g.origin.y = min(max(g.origin.y, vf.minY), max(vf.minY, vf.maxY - g.height))
         return g
@@ -2610,20 +2619,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if key == Self.frameKey {
             sources.append(UserDefaults.standard.string(forKey: "NSWindow Frame WeComCalendarWidget"))
         }
+        // 必须把这扇窗自己的上下限带进夹紧。以前先按日历窗的 768×1040 裁，
+        // 再套子窗上限 —— 上限只能再缩小，宽于 768 的存档（记事本默认 780 也算）
+        // 在这一步就已经丢了，后面的夹紧抬不回来。
+        let lim = VisibleArea.shared.limits[ObjectIdentifier(p)]
         for s in sources.compactMap({ $0 }) {
             var f = NSRectFromString(s)
             guard f.width > 120, f.height > 120 else { continue }
-            // 恢复时也走一遍屏幕夹紧：老存档可能是「比可见区还高」的尺寸
-            f = Self.fitToScreen(f, vf)
-            // 上下限也夹一道：上下限是会变的（比如录屏窗从 420 宽改成 620），
-            // 老存档一旦小于新下限，窗口就会以一个不该存在的尺寸出现
-            if let lim = VisibleArea.shared.limits[ObjectIdentifier(p)] {
-                let w = min(max(f.width, lim.min.width), lim.max.width)
-                let h = min(max(f.height, lim.min.height), lim.max.height)
-                if w != f.width { f.origin.x = min(f.origin.x, vf.maxX - w) }
-                if h != f.height { f.origin.y = max(f.origin.y, vf.minY) }
-                f.size = NSSize(width: w, height: h)
-            }
+            // 恢复时也走一遍屏幕夹紧：老存档可能是「比可见区还高」的尺寸，
+            // 也可能是上下限改过之后留下的过宽 / 过矮尺寸。
+            f = Self.fitToScreen(f, vf, min: lim?.min, max: lim?.max)
             p.setFrame(f, display: false)
             return
         }
@@ -3280,6 +3285,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                   "主菜单 ⌘\(key) 挂的是\(name)（实际标题「\(it?.title ?? "—")」动作\(got)）")
         }
 
+        // 1b) 存档恢复用的是这扇窗自己的上下限，不是日历窗的 768×1040。
+        //     以前 fitToScreen 写死日历窗上限，记事本默认 780 宽一存档再打开就变成 768，
+        //     拉到 1200 的下次启动也回不来。这里用一张比所有上限都大的假屏幕，
+        //     免得跟「可见区比窗口窄」搅在一起。
+        let big = NSRect(x: 0, y: 0, width: 3000, height: 2000)
+        let notesBack = Self.fitToScreen(
+            NSRect(x: 12, y: 40, width: 780, height: 640), big,
+            min: FeaturePane.notes.minSize, max: FeaturePane.notes.maxSize)
+        check(abs(notesBack.width - 780) < 1 && abs(notesBack.height - 640) < 1,
+              "记事本默认 780×640 存档后再打开还是这个尺寸（实际 \(Int(notesBack.width))×\(Int(notesBack.height))），不会被收成日历窗的 768")
+        let notesShort = Self.fitToScreen(
+            NSRect(x: 0, y: 0, width: 700, height: 400), big,
+            min: FeaturePane.notes.minSize, max: FeaturePane.notes.maxSize)
+        check(abs(notesShort.width - 700) < 1 && abs(notesShort.height - FeaturePane.notes.minSize.height) < 1,
+              "记事本矮于下限时抬到 \(Int(FeaturePane.notes.minSize.height))，不是日历窗的 \(Int(Self.minH))（实际 \(Int(notesShort.height))）")
+        for f in FeaturePane.allCases {
+            let wide = NSRect(x: 20, y: 40, width: f.maxSize.width, height: f.defaultSize.height)
+            let got = Self.fitToScreen(wide, big, min: f.minSize, max: f.maxSize)
+            check(abs(got.width - f.maxSize.width) < 1,
+                  "\(f.title)按自己的上限 \(Int(f.maxSize.width)) 恢复宽度（实际 \(Int(got.width))），不套日历窗的 768")
+        }
+        let calOnly = Self.fitToScreen(NSRect(x: 0, y: 0, width: 2000, height: 2000), big)
+        check(abs(calOnly.width - Self.maxW) < 1 && abs(calOnly.height - Self.maxH) < 1,
+              "日历窗不传上下限时仍按 \(Int(Self.maxW))×\(Int(Self.maxH)) 封顶（实际 \(Int(calOnly.width))×\(Int(calOnly.height))）")
+
         // 2) 走菜单动作真开一遍，顺便看尺寸有没有被夹在自己的上下限里
         for f in FeaturePane.allCases {
             guard let it = appSub?.items.first(where: { $0.action == sel(f) }) else {
@@ -3293,6 +3323,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             check(s.width >= f.minSize.width - 1, "\(f.title)窗口没小于下限（\(Int(f.minSize.width))×\(Int(f.minSize.height))）")
             check(s.width <= f.maxSize.width + 1 && s.height <= f.maxSize.height + 1,
                   "\(f.title)窗口没超上限（\(Int(f.maxSize.width))×\(Int(f.maxSize.height))）")
+        }
+
+        // 2b) 真走一遍 restoreFrame。纯函数绿了还不够：以前夹紧函数是对的、
+        //     调用处仍先按日历窗裁，宽存档照样丢。这里把记事本存成 1000 宽再恢复。
+        if let notes = featurePanel(.notes) {
+            let key = FeaturePane.notes.frameKey
+            let prev = UserDefaults.standard.string(forKey: key)
+            let before = notes.frame
+            let planted = NSRect(x: 30, y: 50, width: 1000, height: 640)
+            UserDefaults.standard.set(NSStringFromRect(planted), forKey: key)
+            restoreFrame(notes, key: key, fallback: FeaturePane.notes.defaultSize)
+            let vf = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? big
+            let expect = Self.fitToScreen(planted, vf,
+                                           min: FeaturePane.notes.minSize,
+                                           max: FeaturePane.notes.maxSize)
+            let w = notes.frame.width
+            check(abs(w - expect.width) < 2 && (vf.width <= Self.maxW || w > Self.maxW + 1),
+                  "记事本按存档恢复宽度 \(Int(expect.width))（实际 \(Int(w))），没有被日历窗的 768 裁掉")
+            // 后面关掉窗口会把当前尺寸写回存档。先把窗口和存档都放回去，
+            // 免得这一条用例改掉用户自己记住的记事本大小。
+            notes.setFrame(before, display: false)
+            saveWorks[ObjectIdentifier(notes)]?.cancel()
+            if let prev {
+                UserDefaults.standard.set(prev, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        } else {
+            check(false, "记事本窗口不在，没法验存档恢复")
         }
 
         // 3) 关掉再打开：必须是同一个窗口对象（复用 = 状态还在），不是重建
